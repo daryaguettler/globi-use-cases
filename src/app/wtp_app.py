@@ -449,38 +449,50 @@ def _ac_compute_curve(shape: str, start: float, end: float, n: int) -> np.ndarra
 
 def _render_adoption_tab() -> None:
     st.markdown("## Step 3 — Adoption Curves")
-    st.markdown(
-        "Build and parametrize adoption curve scenarios. Each scenario defines the fraction of "
-        "buildings that have adopted the retrofit by each year. The chart updates live as you "
-        "adjust parameters — click **Save curve** to persist."
-    )
 
     raw = _load_adoption_curves()
     scenarios: dict = raw.get("scenarios", {})
     curve_years = list(range(2024, 2051))
     colors = _curve_colors()
 
-    # ── Scenario selector row ──────────────────────────────────────────────────
-    sel_col, add_col1, add_col2, del_col = st.columns([3, 2, 1, 1], vertical_alignment="bottom")
-    with sel_col:
-        scenario_names = list(scenarios.keys())
-        default_sel = st.session_state.get("adoption_scenario")
-        sel_idx = scenario_names.index(default_sel) if default_sel in scenario_names else 0
-        selected = st.selectbox(
-            "Active scenario", options=scenario_names or ["—"],
-            index=sel_idx, key="ac_selected",
-            help="This scenario is used in the analysis (Step 5).",
-        ) if scenario_names else None
-        if selected:
-            st.session_state["adoption_scenario"] = selected
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Manage scenarios (add / remove)
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### Manage Scenarios")
+    st.caption("Add new scenarios or remove existing ones before parametrizing.")
 
+    # List existing scenarios with remove buttons
+    if scenarios:
+        for sname in list(scenarios.keys()):
+            row_col, btn_col = st.columns([6, 1], vertical_alignment="center")
+            with row_col:
+                desc = scenarios[sname].get("description", "")
+                st.markdown(f"**{sname}**" + (f" — _{desc}_" if desc else ""))
+            with btn_col:
+                remove_disabled = len(scenarios) <= 1
+                if st.button(
+                    "Remove", key=f"rm_{sname}",
+                    disabled=remove_disabled,
+                    help="Cannot remove the last scenario." if remove_disabled else None,
+                ):
+                    del raw["scenarios"][sname]
+                    _save_adoption_curves(raw)
+                    # Switch active selection away from deleted scenario
+                    if st.session_state.get("adoption_scenario") == sname:
+                        remaining = [k for k in raw.get("scenarios", {}) if k != sname]
+                        st.session_state["adoption_scenario"] = remaining[0] if remaining else None
+                    st.rerun()
+    else:
+        st.info("No scenarios yet — add one below to get started.")
+
+    # Add new scenario row
+    add_col1, add_col2, _ = st.columns([3, 1, 4], vertical_alignment="bottom")
     with add_col1:
         new_name = st.text_input(
             "New scenario name", placeholder="e.g. fast_2030", key="ac_new_name",
-            label_visibility="collapsed",
         )
     with add_col2:
-        if st.button("Add", key="ac_add_btn"):
+        if st.button("Add scenario", key="ac_add_btn", type="secondary"):
             n = new_name.strip()
             if not n:
                 st.error("Enter a name.")
@@ -494,37 +506,45 @@ def _render_adoption_tab() -> None:
                 }
                 raw["scenarios"][n] = template
                 _save_adoption_curves(raw)
-                st.success(f"Added '{n}'.")
+                st.session_state["adoption_scenario"] = n
                 st.rerun()
-    with del_col:
-        if selected and len(scenario_names) > 1 and st.button("Delete", key="ac_del"):
-            del raw["scenarios"][selected]
-            _save_adoption_curves(raw)
-            st.warning(f"Deleted '{selected}'.")
-            st.rerun()
 
-    if not scenarios or selected is None:
-        st.info("Add a scenario above to get started.")
+    if not scenarios:
+        st.divider()
         _ac_render_projection_period()
         return
 
     st.divider()
 
-    # ── Parametrize selected scenario ─────────────────────────────────────────
-    st.markdown(f"### Parametrize — *{selected}*")
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Parametrize selected scenario
+    # ══════════════════════════════════════════════════════════════════════════
+    st.markdown("### Parametrize")
+    st.caption(
+        "Select a scenario and adjust its shape. Changes preview live — click "
+        "**Save curve** to persist."
+    )
+
+    scenario_names = list(scenarios.keys())
+    default_sel = st.session_state.get("adoption_scenario")
+    sel_idx = scenario_names.index(default_sel) if default_sel in scenario_names else 0
+    selected = st.selectbox(
+        "Scenario to edit", options=scenario_names,
+        index=sel_idx, key="ac_selected",
+    )
+    st.session_state["adoption_scenario"] = selected
+
     scen_data = copy.deepcopy(scenarios[selected])
 
     p_col1, p_col2, p_col3 = st.columns(3)
     with p_col1:
+        shape_opts = ["Linear", "Sigmoid", "Exponential"]
+        saved_shape = scen_data.get("curve_type", "linear").capitalize()
         qf_shape = st.selectbox(
-            "Curve shape", ["Linear", "Sigmoid", "Exponential"],
-            index=["Linear", "Sigmoid", "Exponential"].index(
-                scen_data.get("curve_type", "linear").capitalize()
-                if scen_data.get("curve_type", "linear").capitalize() in ["Linear", "Sigmoid", "Exponential"]
-                else "Linear"
-            ),
+            "Curve shape", shape_opts,
+            index=shape_opts.index(saved_shape) if saved_shape in shape_opts else 0,
             key="qf_shape",
-            help="Linear: constant rate. Sigmoid: slow start, fast middle, slow end. Exponential: accelerating adoption.",
+            help="Linear: constant rate. Sigmoid: slow start, fast middle, slow end. Exponential: accelerating.",
         )
     with p_col2:
         qf_start = st.number_input(
@@ -563,7 +583,6 @@ def _render_adoption_tab() -> None:
     preview_ys = np.clip(_ac_compute_curve(qf_shape, qf_start, qf_end, len(curve_years)), 0.0, new_max)
 
     fig = go.Figure()
-    # Other scenarios — faded background
     for i, (name, s) in enumerate(scenarios.items()):
         if name == selected:
             continue
@@ -572,9 +591,8 @@ def _render_adoption_tab() -> None:
             x=curve_years, y=[v * 100 for v in saved_ys],
             name=name,
             line=dict(color=colors[i % len(colors)], width=1.5, dash="dot"),
-            opacity=0.45,
+            opacity=0.4,
         ))
-    # Active scenario — live preview
     fig.add_trace(go.Scatter(
         x=curve_years, y=[v * 100 for v in preview_ys],
         name=f"{selected} (preview)",
@@ -589,7 +607,7 @@ def _render_adoption_tab() -> None:
     st.plotly_chart(fig, use_container_width=True)
 
     # ── Save / reset ───────────────────────────────────────────────────────────
-    save_col, reset_col, _ = st.columns([1, 1, 4])
+    save_col, reset_col, _ = st.columns([1, 1, 4], vertical_alignment="center")
     with save_col:
         if st.button("Save curve", type="primary", key="ac_save"):
             scen_data["values"] = {str(y): round(float(v), 4) for y, v in zip(curve_years, preview_ys)}
@@ -1090,10 +1108,13 @@ def _render_result_charts() -> None:
 
     with col_e:
         st.markdown("### Energy Savings vs. Propensity")
-        plot_df = policy_impacts.join(
-            propensity_result.data.set_index("building.id")[["acceptance_probability"]],
-            on="building.id", how="left",
-        )
+        if "acceptance_probability" not in policy_impacts.columns:
+            plot_df = policy_impacts.join(
+                propensity_result.data.set_index("building.id")[["acceptance_probability"]],
+                on="building.id", how="left",
+            )
+        else:
+            plot_df = policy_impacts
         if "acceptance_probability" in plot_df.columns and "energy_cost.annual_savings" in plot_df.columns:
             fig_scatter = go.Figure(go.Scatter(
                 x=plot_df["energy_cost.annual_savings"],

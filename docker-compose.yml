@@ -1,8 +1,4 @@
-services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    ports:
-      - "${PORT:-8501}:8501"
-    # add env_file: [.env] when you need secrets locally
+name: globi-use-cases
+
+# base compose project; visualizer is defined in docker-compose.st.yml (see make viz)
+services: {}

@@ -1,17 +1,45 @@
-.PHONY: install run run-local copy-env docker-build docker-run clean
+.PHONY: install run run-local copy-env viz viz-down viz-logs docker-build docker-run clean
+
+COMPOSE        ?= docker compose
+COMPOSE_FILES  ?= -f docker-compose.yml -f docker-compose.st.yml
+OPEN_BROWSER   ?= 1
 
 # ── Local development ──────────────────────────────────────────────────────────
 
 install:
 	uv sync
 
-# optional hook before compose (e.g. cp .env.example .env) — extend as needed
 copy-env:
-	@true
+	@scripts/copy_envexample_to_env.sh
 
-# run in docker: no local python/uv deps; image installs deps via uv in the build
-run: copy-env
-	PORT=$(PORT) docker compose up app --build
+# build/start only the streamlit visualizer (no local uv/python deps)
+viz: copy-env
+	$(COMPOSE) $(COMPOSE_FILES) up visualizer --build -d --remove-orphans
+	@p=$$(grep -E '^[[:space:]]*PORT[[:space:]]*=' .env 2>/dev/null | tail -1 | sed 's/^[^=]*=//' | tr -d '\r'); \
+	p=$${p:-8501}; \
+	url="http://localhost:$$p/"; \
+	echo "streamlit: $$url"; \
+	if command -v curl >/dev/null 2>&1; then \
+	  i=0; \
+	  while [ $$i -lt 60 ]; do \
+	    if curl -sf "http://127.0.0.1:$$p/_stcore/health" >/dev/null 2>&1; then break; fi; \
+	    i=$$((i+1)); \
+	    sleep 0.5; \
+	  done; \
+	else sleep 2; fi; \
+	if [ "$(OPEN_BROWSER)" = "1" ]; then \
+	  ( command -v open >/dev/null 2>&1 && open "$$url" ) \
+	  || ( command -v xdg-open >/dev/null 2>&1 && xdg-open "$$url" ) \
+	  || true; \
+	fi
+
+viz-down:
+	$(COMPOSE) $(COMPOSE_FILES) stop visualizer
+
+viz-logs:
+	$(COMPOSE) $(COMPOSE_FILES) logs -f visualizer
+
+run: viz
 
 run-local:
 	PYTHONPATH=src uv run streamlit run src/app/wtp_app.py
@@ -21,13 +49,13 @@ run-local:
 editor:
 	PYTHONPATH=src uv run streamlit run src/tools/viz/wip/interface.py
 
-# ── Docker ─────────────────────────────────────────────────────────────────────
+# ── Docker (image without compose) ─────────────────────────────────────────────
 
 IMAGE_NAME ?= globi-use-cases
 PORT       ?= 8501
 
 docker-build:
-	docker build -t $(IMAGE_NAME) .
+	docker build -f docker/visualizer/Dockerfile -t $(IMAGE_NAME) .
 
 docker-run:
 	docker run --rm -p $(PORT):8501 $(IMAGE_NAME)
