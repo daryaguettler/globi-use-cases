@@ -1,0 +1,20 @@
+{
+    "analysis_years": [
+        2025,
+        2030,
+        2035,
+        2040,
+        2045,
+        2050
+    ],
+    "year_files": {
+        "2025": "EnergyAndPeak.pq",
+        "2030": "EnergyAndPeak.pq",
+        "2035": "EnergyAndPeak.pq",
+        "2040": "EnergyAndPeak.pq",
+        "2045": "EnergyAndPeak.pq",
+        "2050": "EnergyAndPeak.pq"
+    },
+    "retrofit_cost_per_sqm": 50.0,
+    "scenario_name": "Retrofit_1"
+}
