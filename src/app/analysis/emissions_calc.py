@@ -72,8 +72,9 @@ def interpolate_emissions_factors(
             fuel_data = factors_by_fuel.get(fuel, {})
             values: dict[str, float] = fuel_data.get("values", fuel_data)  # handle both
             if not values:
-                # Linear interpolation using defaults
-                t = (year - 2024) / (2050 - 2024)
+                # Linear interpolation using defaults, clamped so years > 2050
+                # hold the 2050 value rather than extrapolating to negatives.
+                t = max(0.0, min(1.0, (year - 2024) / (2050 - 2024)))
                 row[fuel] = (
                     _DEFAULT_FACTORS_2024[fuel]
                     + t * (_DEFAULT_FACTORS_2050[fuel] - _DEFAULT_FACTORS_2024[fuel])

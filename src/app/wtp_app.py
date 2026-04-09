@@ -15,14 +15,27 @@ from __future__ import annotations
 
 import io
 import json
+import random
 import sys
 import copy
+import zipfile
+from functools import reduce
 from pathlib import Path
 
+import matplotlib
+import matplotlib.cm
+import matplotlib.colors
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
+
+import folium
+import geopandas as gpd
+from scipy import stats
+from streamlit_folium import st_folium
 
 # Add repo root to path so use_cases imports work
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -43,8 +56,8 @@ _DATA_DIR = _REPO_ROOT / "data" / "inputs"
 _ADOPTION_CURVES_PATH = _DATA_DIR / "adoption_curves.json"
 _EMISSIONS_PATH = _DATA_DIR / "emissions_trajectories.json"
 
-_YEARS_RANGE = list(range(2024, 2061))
-_PROJECTION_YEARS = list(range(2025, 2051))
+_YEARS_RANGE = list(range(2024, 2101))
+_PROJECTION_YEARS = list(range(2025, 2101))
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -452,7 +465,7 @@ def _render_adoption_tab() -> None:
 
     raw = _load_adoption_curves()
     scenarios: dict = raw.get("scenarios", {})
-    curve_years = list(range(2024, 2051))
+    curve_years = list(range(2024, 2101))
     colors = _curve_colors()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -554,8 +567,8 @@ def _render_adoption_tab() -> None:
         )
     with p_col3:
         qf_end = st.number_input(
-            "End adoption (2050)", min_value=0.0, max_value=1.0,
-            value=float(scen_data.get("values", {}).get("2050", scen_data.get("max_adoption", 0.85))),
+            "End adoption (2100)", min_value=0.0, max_value=1.0,
+            value=float(scen_data.get("values", {}).get("2100", scen_data.get("values", {}).get("2050", scen_data.get("max_adoption", 0.85)))),
             step=0.01, format="%.2f", key="qf_end",
         )
 
@@ -634,13 +647,13 @@ def _ac_render_projection_period() -> None:
     py_col1, py_col2 = st.columns(2)
     with py_col1:
         start_year = st.number_input(
-            "Start year", 2024, 2060,
+            "Start year", 2024, 2099,
             int(st.session_state.get("proj_start_year", 2025)), 1,
             key="cfg_start_year",
         )
     with py_col2:
         end_year = st.number_input(
-            "End year", 2025, 2070,
+            "End year", 2025, 2100,
             int(st.session_state.get("proj_end_year", 2050)), 1,
             key="cfg_end_year",
         )
@@ -664,7 +677,7 @@ def _render_emissions_tab() -> None:
 
     emissions_data = _load_emissions_json()
     fuels_cfg: dict = emissions_data.get("fuels", {})
-    plot_years = list(range(2024, 2051))
+    plot_years = list(range(2024, 2101))
 
     # Per-fuel editors
     for fuel in FUEL_LABELS:
@@ -675,12 +688,12 @@ def _render_emissions_tab() -> None:
             # Quick set: start + end values + shape
             qe_col1, qe_col2, qe_col3 = st.columns(3)
             current_start = float(values.get("2024", 0.3))
-            current_end = float(values.get("2050", 0.1))
+            current_end = float(values.get("2100", values.get("2050", 0.1)))
             with qe_col1:
                 v_start = st.number_input(f"{fuel} — 2024 value (kg CO2/kWh)",
                                           0.0, 5.0, current_start, 0.01,
                                           key=f"em_{fuel}_start")
-                v_end = st.number_input(f"{fuel} — 2050 value (kg CO2/kWh)",
+                v_end = st.number_input(f"{fuel} — 2100 value (kg CO2/kWh)",
                                         0.0, 5.0, current_end, 0.01,
                                         key=f"em_{fuel}_end")
             with qe_col2:
@@ -937,14 +950,14 @@ def _apply_non_us_priors(engine: PropensityModelEngine) -> None:
 
 # (line_color, band_rgba) pairs — one per adoption scenario
 _SCENARIO_PALETTE = [
-    ("#2563eb", "rgba(37,99,235,0.12)"),
-    ("#16a34a", "rgba(22,163,74,0.12)"),
-    ("#9333ea", "rgba(147,51,234,0.12)"),
-    ("#ea580c", "rgba(234,88,12,0.12)"),
-    ("#0891b2", "rgba(8,145,178,0.12)"),
-    ("#65a30d", "rgba(101,163,13,0.12)"),
-    ("#db2777", "rgba(219,39,119,0.12)"),
-    ("#854d0e", "rgba(133,77,14,0.12)"),
+    ("#2563eb", "rgba(37,99,235,0.20)"),
+    ("#16a34a", "rgba(22,163,74,0.20)"),
+    ("#9333ea", "rgba(147,51,234,0.20)"),
+    ("#ea580c", "rgba(234,88,12,0.20)"),
+    ("#0891b2", "rgba(8,145,178,0.20)"),
+    ("#65a30d", "rgba(101,163,13,0.20)"),
+    ("#db2777", "rgba(219,39,119,0.20)"),
+    ("#854d0e", "rgba(133,77,14,0.20)"),
 ]
 
 
@@ -960,18 +973,24 @@ def _add_scenario_traces(
     y_scale: float = 1.0,
 ) -> None:
     """Add a mean line + P10/P90 band for one scenario to *fig*."""
-    if p10_pct is not None and p90_pct is not None:
+    has_band = p10_pct is not None and p90_pct is not None
+    if has_band:
         fig.add_trace(go.Scatter(
             x=years + years[::-1],
             y=(p90_pct * y_scale).tolist() + (p10_pct * y_scale).iloc[::-1].tolist(),
             fill="toself", fillcolor=band_rgba,
             line=dict(color="rgba(0,0,0,0)"),
-            showlegend=False, hoverinfo="skip",
+            name=f"{name} P10–P90",
+            showlegend=True,
+            legendgroup=name,
+            hovertemplate="%{y:.2f}<extra>P10–P90</extra>",
         ))
     fig.add_trace(go.Scatter(
         x=years, y=(mean_pct * y_scale).tolist(),
-        mode="lines", name=name,
+        mode="lines", name=f"{name} (mean)" if has_band else name,
         line=dict(color=line_color, width=2.5),
+        legendgroup=name,
+        hovertemplate="%{y:.2f}<extra>" + name + " mean</extra>",
     ))
 
 
@@ -1059,25 +1078,55 @@ def _render_result_charts() -> None:
     )
     st.plotly_chart(fig_adopt, use_container_width=True)
 
-    # ── Emissions trajectories — all scenarios with bands + baseline ───────────
+    # ── Emissions trajectories — baseline + scenarios with ±10% bands ──────────
     st.divider()
     st.markdown("### Emissions Trajectories (metric tonnes CO₂/yr)")
+    st.caption("Shaded band = ±10% uncertainty around the mean scenario trajectory.")
     fig_em = go.Figure()
+
+    # Baseline: all buildings on baseline energy forever (zero adoption)
     if not first_em.empty:
         fig_em.add_trace(go.Scatter(
-            x=first_em["year"].tolist(), y=first_em["baseline_emissions_t"].tolist(),
-            mode="lines", name="Baseline (no retrofit)",
-            line=dict(color="#dc2626", width=2, dash="dash"),
+            x=first_em["year"].tolist(),
+            y=first_em["baseline_emissions_t"].tolist(),
+            mode="lines",
+            name="Baseline (0% adoption)",
+            line=dict(color="#dc2626", width=2.5, dash="dot"),
         ))
+
     for i, (name, res) in enumerate(scenario_results.items()):
         em = res["emissions"]
         if em.empty:
             continue
         line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
-        years = em["year"].tolist()
-        p10 = em["scenario_p10_t"] if "scenario_p10_t" in em.columns else None
-        p90 = em["scenario_p90_t"] if "scenario_p90_t" in em.columns else None
-        _add_scenario_traces(fig_em, years, em["scenario_mean_t"], p10, p90, name, line_color, band_rgba)
+        yrs = em["year"].tolist()
+        mean_vals = em["scenario_mean_t"].tolist()
+        lo_vals = [v * 0.90 for v in mean_vals]
+        hi_vals = [v * 1.10 for v in mean_vals]
+
+        # Lower bound — invisible anchor
+        fig_em.add_trace(go.Scatter(
+            x=yrs, y=lo_vals,
+            mode="lines", line=dict(color="rgba(0,0,0,0)"),
+            showlegend=False, hoverinfo="skip",
+            legendgroup=name,
+        ))
+        # Upper bound — fills down to lower bound
+        fig_em.add_trace(go.Scatter(
+            x=yrs, y=hi_vals,
+            mode="lines", line=dict(color="rgba(0,0,0,0)"),
+            fill="tonexty", fillcolor=band_rgba,
+            showlegend=False, hoverinfo="skip",
+            legendgroup=name,
+        ))
+        # Mean line
+        fig_em.add_trace(go.Scatter(
+            x=yrs, y=mean_vals,
+            mode="lines", name=name,
+            line=dict(color=line_color, width=2.5),
+            legendgroup=name,
+        ))
+
     for yr in simulated_years:
         fig_em.add_vline(
             x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
@@ -1086,7 +1135,7 @@ def _render_result_charts() -> None:
         )
     fig_em.update_layout(
         yaxis_title="tCO₂/yr", xaxis_title="Year",
-        height=380, margin=dict(t=20, b=20),
+        height=400, margin=dict(t=20, b=20),
         legend=dict(orientation="h", y=-0.2),
     )
     st.plotly_chart(fig_em, use_container_width=True)
@@ -1175,6 +1224,752 @@ def _render_result_charts() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — WIP EXPLORER  (National Retrofit Deal Acceptance Simulator)
+# ══════════════════════════════════════════════════════════════════════════════
+
+_CENSUS_API_KEY = "e865d3af152108cb504df27535d196f586c21729"
+
+_WIP_COEFFICIENTS = {
+    "intercept": 0.0,
+    "Year built": -0.051,
+    "Education": 0.110,
+    "bedrooms": 0.272,
+    "residents": 0.087,
+    "Income": 0.046,
+    "Concern": 0.271,
+    "Upfront cost": -0.058,
+    "Neighbor": -0.029,
+    "Energy cost": -0.012,
+}
+
+_US_STATES = {
+    "Alabama": "01", "Alaska": "02", "Arizona": "04", "Arkansas": "05",
+    "California": "06", "Colorado": "08", "Connecticut": "09", "Delaware": "10",
+    "District of Columbia": "11", "Florida": "12", "Georgia": "13", "Hawaii": "15",
+    "Idaho": "16", "Illinois": "17", "Indiana": "18", "Iowa": "19", "Kansas": "20",
+    "Kentucky": "21", "Louisiana": "22", "Maine": "23", "Maryland": "24",
+    "Massachusetts": "25", "Michigan": "26", "Minnesota": "27", "Mississippi": "28",
+    "Missouri": "29", "Montana": "30", "Nebraska": "31", "Nevada": "32",
+    "New Hampshire": "33", "New Jersey": "34", "New Mexico": "35", "New York": "36",
+    "North Carolina": "37", "North Dakota": "38", "Ohio": "39", "Oklahoma": "40",
+    "Oregon": "41", "Pennsylvania": "42", "Rhode Island": "44", "South Carolina": "45",
+    "South Dakota": "46", "Tennessee": "47", "Texas": "48", "Utah": "49",
+    "Vermont": "50", "Virginia": "51", "Washington": "53", "West Virginia": "54",
+    "Wisconsin": "55", "Wyoming": "56",
+}
+
+_STATE_MAP_CONFIG = {
+    "Alabama": ([32.8, -86.8], 7), "Alaska": ([64.2, -153.4], 4),
+    "Arizona": ([34.3, -111.1], 7), "Arkansas": ([34.8, -92.2], 7),
+    "California": ([36.8, -119.4], 6), "Colorado": ([39.0, -105.5], 7),
+    "Connecticut": ([41.6, -72.7], 9), "Delaware": ([38.9, -75.5], 9),
+    "District of Columbia": ([38.9, -77.0], 12), "Florida": ([27.7, -81.7], 7),
+    "Georgia": ([32.2, -83.4], 7), "Hawaii": ([20.8, -156.3], 7),
+    "Idaho": ([44.2, -114.5], 6), "Illinois": ([40.0, -89.2], 7),
+    "Indiana": ([40.3, -86.1], 7), "Iowa": ([41.9, -93.1], 7),
+    "Kansas": ([38.5, -98.3], 7), "Kentucky": ([37.7, -84.9], 7),
+    "Louisiana": ([31.2, -91.8], 7), "Maine": ([44.7, -69.4], 7),
+    "Maryland": ([39.1, -76.8], 8), "Massachusetts": ([42.4, -71.4], 8),
+    "Michigan": ([44.2, -85.4], 7), "Minnesota": ([46.4, -93.1], 6),
+    "Mississippi": ([32.7, -89.7], 7), "Missouri": ([38.5, -92.5], 7),
+    "Montana": ([47.0, -110.5], 6), "Nebraska": ([41.5, -99.9], 7),
+    "Nevada": ([38.8, -116.4], 6), "New Hampshire": ([43.7, -71.6], 8),
+    "New Jersey": ([40.1, -74.5], 8), "New Mexico": ([34.5, -105.9], 7),
+    "New York": ([42.9, -75.5], 7), "North Carolina": ([35.6, -79.8], 7),
+    "North Dakota": ([47.5, -100.5], 7), "Ohio": ([40.4, -82.8], 7),
+    "Oklahoma": ([35.6, -96.9], 7), "Oregon": ([44.6, -122.1], 7),
+    "Pennsylvania": ([40.9, -77.8], 7), "Rhode Island": ([41.7, -71.5], 10),
+    "South Carolina": ([33.8, -80.9], 7), "South Dakota": ([44.4, -100.2], 7),
+    "Tennessee": ([35.9, -86.4], 7), "Texas": ([31.1, -97.6], 6),
+    "Utah": ([39.3, -111.1], 7), "Vermont": ([44.0, -72.7], 8),
+    "Virginia": ([37.8, -79.5], 7), "Washington": ([47.4, -120.7], 7),
+    "West Virginia": ([38.9, -80.5], 7), "Wisconsin": ([44.3, -89.6], 7),
+    "Wyoming": ([43.0, -107.6], 7),
+}
+
+_MA_CENSUS_CSV = _REPO_ROOT / "data" / "census_data" / "massachusetts_census_data.csv"
+_MA_COUNTY_FIPS = {
+    1: "Barnstable", 3: "Berkshire", 5: "Bristol", 7: "Dukes", 9: "Essex",
+    11: "Franklin", 13: "Hampden", 15: "Hampshire", 17: "Middlesex",
+    19: "Nantucket", 21: "Norfolk", 23: "Plymouth", 25: "Suffolk", 27: "Worcester",
+}
+
+_ACS_VARIABLE_CHUNKS = {
+    "income": {
+        "endpoint": "acs/acs5",
+        "vars": {
+            "B19001_001E": "income_total_households",
+            "B19001_002E": "income_less_than_10k",
+            "B19001_003E": "income_10k_to_14999",
+            "B19001_004E": "income_15k_to_19999",
+            "B19001_005E": "income_20k_to_24999",
+            "B19001_006E": "income_25k_to_29999",
+            "B19001_007E": "income_30k_to_34999",
+            "B19001_008E": "income_35k_to_39999",
+            "B19001_009E": "income_40k_to_44999",
+            "B19001_010E": "income_45k_to_49999",
+            "B19001_011E": "income_50k_to_59999",
+            "B19001_012E": "income_60k_to_74999",
+            "B19001_013E": "income_75k_to_99999",
+            "B19001_014E": "income_100k_to_124999",
+            "B19001_015E": "income_125k_to_149999",
+            "B19001_016E": "income_150k_to_199999",
+            "B19001_017E": "income_200k_or_more",
+        },
+    },
+    "education": {
+        "endpoint": "acs/acs5",
+        "vars": {
+            "B15003_001E": "education_total_pop_25_over",
+            "B15003_002E": "education_no_schooling",
+            "B15003_017E": "education_high_school_grad",
+            "B15003_018E": "education_ged",
+            "B15003_021E": "education_associates_degree",
+            "B15003_022E": "education_bachelors_degree",
+            "B15003_023E": "education_masters_degree",
+            "B15003_024E": "education_professional_school_degree",
+            "B15003_025E": "education_doctorate_degree",
+        },
+    },
+    "age": {
+        "endpoint": "acs/acs5/profile",
+        "vars": {
+            "DP05_0001E": "age_total_population",
+            "DP05_0005E": "age_under_5",
+            "DP05_0006E": "age_5_to_9",
+            "DP05_0007E": "age_10_to_14",
+            "DP05_0008E": "age_15_to_19",
+            "DP05_0009E": "age_20_to_24",
+            "DP05_0010E": "age_25_to_34",
+            "DP05_0011E": "age_35_to_44",
+            "DP05_0012E": "age_45_to_54",
+            "DP05_0013E": "age_55_to_59",
+            "DP05_0014E": "age_60_to_64",
+            "DP05_0015E": "age_65_to_74",
+            "DP05_0016E": "age_75_to_84",
+            "DP05_0017E": "age_85_and_over",
+            "DP05_0018E": "median_age",
+        },
+    },
+    "household_size": {
+        "endpoint": "acs/acs5",
+        "vars": {
+            "B11016_001E": "household_total",
+            "B11016_002E": "household_1_person",
+            "B11016_003E": "household_2_person",
+            "B11016_004E": "household_3_person",
+            "B11016_005E": "household_4_person",
+            "B11016_006E": "household_5_person",
+            "B11016_007E": "household_6_person",
+            "B11016_008E": "household_7_or_more_person",
+        },
+    },
+}
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _wip_load_ma_census(file_path: str) -> pd.DataFrame | None:
+    import os
+    if not os.path.exists(file_path):
+        return None
+    df = pd.read_csv(file_path)
+
+    def _to_int_county(code):
+        try:
+            return int(str(code).split(".")[0])
+        except Exception:
+            return None
+
+    df["county_name"] = df["county"].apply(lambda c: _MA_COUNTY_FIPS.get(_to_int_county(c)))
+    df["tract_str"] = df["tract"].astype(str).str.split(".").str[0].str.strip().str.zfill(6)
+    df["display_label"] = "Tract " + df["tract_str"] + ", " + df["county_name"] + " County"
+    return df.set_index("display_label")
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _wip_fetch_census(state_fips: str) -> pd.DataFrame | None:
+    dataframes = []
+    for chunk_name, chunk in _ACS_VARIABLE_CHUNKS.items():
+        base_url = f"https://api.census.gov/data/2023/{chunk['endpoint']}"
+        params = {
+            "get": ",".join(chunk["vars"].keys()),
+            "for": "tract:*",
+            "in": f"state:{state_fips}",
+            "key": _CENSUS_API_KEY,
+        }
+        try:
+            resp = requests.get(base_url, params=params, timeout=60)
+        except Exception as exc:
+            st.error(f"Census API request failed: {exc}")
+            return None
+        if resp.status_code != 200:
+            st.error(f"Census API error ({chunk_name}): HTTP {resp.status_code}")
+            return None
+        data = resp.json()
+        df = pd.DataFrame(data[1:], columns=data[0]).rename(columns=chunk["vars"])
+        dataframes.append(df)
+    merged = reduce(
+        lambda l, r: pd.merge(l, r, on=["state", "county", "tract"], how="outer"),
+        dataframes,
+    )
+    for col in merged.columns:
+        if col not in ("state", "county", "tract"):
+            merged[col] = pd.to_numeric(merged[col], errors="coerce")
+    return merged
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _wip_fetch_county_names(state_fips: str) -> dict[str, str]:
+    try:
+        resp = requests.get(
+            "https://api.census.gov/data/2020/dec/pl",
+            params={"get": "NAME", "for": "county:*", "in": f"state:{state_fips}", "key": _CENSUS_API_KEY},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return {}
+        result = {}
+        for row in resp.json()[1:]:
+            name, county_fips = row[0], row[2]
+            short = name.split(" County")[0].split(" Parish")[0].split(" Borough")[0]
+            result[county_fips.zfill(3)] = short
+        return result
+    except Exception:
+        return {}
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _wip_fetch_shapefile(state_fips: str):
+    url = f"https://www2.census.gov/geo/tiger/TIGER2020/TRACT/tl_2020_{state_fips}_tract.zip"
+    try:
+        resp = requests.get(url, timeout=120)
+        if resp.status_code != 200:
+            return None
+        tmpdir = f"/tmp/tiger_{state_fips}"
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            z.extractall(tmpdir)
+            shp_files = [f for f in z.namelist() if f.endswith(".shp")]
+        if not shp_files:
+            return None
+        return gpd.read_file(f"{tmpdir}/{shp_files[0]}")
+    except Exception:
+        return None
+
+
+def _wip_build_display_df(raw_df: pd.DataFrame, county_names: dict[str, str]) -> pd.DataFrame:
+    df = raw_df.copy()
+
+    def county_label(c):
+        try:
+            return county_names.get(str(int(str(c).split(".")[0])).zfill(3), f"County {c}")
+        except Exception:
+            return str(c)
+
+    df["county_name"] = df["county"].apply(county_label)
+    df["tract_str"] = df["tract"].astype(str).str.split(".").str[0].str.strip().str.zfill(6)
+    df["display_label"] = "Tract " + df["tract_str"] + ", " + df["county_name"] + " County"
+    return df.set_index("display_label")
+
+
+def _wip_weight(x) -> float:
+    try:
+        v = float(x)
+        return v if np.isfinite(v) and v >= 0 else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _wip_run_simulation(tract_data, building_age, upfront_cost_range, energy_cost_range, concern, neighbor, n_runs=10000) -> np.ndarray:
+    edu_cats = [1, 2, 3, 4]
+    edu_counts = [
+        _wip_weight(tract_data[["education_high_school_grad", "education_ged"]].sum()),
+        _wip_weight(tract_data["education_associates_degree"]),
+        _wip_weight(tract_data["education_bachelors_degree"]),
+        _wip_weight(tract_data[["education_masters_degree", "education_professional_school_degree", "education_doctorate_degree"]].sum()),
+    ]
+    hh_cats = [1, 2, 3, 4, 5, 6, 7]
+    hh_counts = np.array([_wip_weight(tract_data[c]) for c in (
+        "household_1_person", "household_2_person", "household_3_person", "household_4_person",
+        "household_5_person", "household_6_person", "household_7_or_more_person",
+    )], dtype=float)
+    inc_cats = [5, 12.5, 17.5, 22.5, 27.5, 32.5, 37.5, 42.5, 47.5, 55, 67.5, 87.5, 112.5, 137.5, 175, 250]
+    inc_counts = np.array([_wip_weight(tract_data[c]) for c in (
+        "income_less_than_10k", "income_10k_to_14999", "income_15k_to_19999", "income_20k_to_24999",
+        "income_25k_to_29999", "income_30k_to_34999", "income_35k_to_39999", "income_40k_to_44999",
+        "income_45k_to_49999", "income_50k_to_59999", "income_60k_to_74999", "income_75k_to_99999",
+        "income_100k_to_124999", "income_125k_to_149999", "income_150k_to_199999", "income_200k_or_more",
+    )], dtype=float)
+
+    C = _WIP_COEFFICIENTS
+    probs = []
+    for _ in range(n_runs):
+        edu = random.choices(edu_cats, weights=edu_counts, k=1)[0] if sum(edu_counts) > 0 else 1
+        hh = random.choices(hh_cats, weights=hh_counts, k=1)[0] if float(np.sum(hh_counts)) > 0 else 2
+        inc = random.choices(inc_cats, weights=inc_counts, k=1)[0] if float(np.sum(inc_counts)) > 0 else 55
+        cost = random.uniform(*upfront_cost_range)
+        energy = random.uniform(*energy_cost_range)
+        Z = (C["intercept"] + C["Year built"] * building_age + C["Education"] * edu
+             + C["bedrooms"] * hh + C["residents"] * hh + C["Income"] * inc
+             + C["Concern"] * concern + C["Upfront cost"] * cost
+             + C["Neighbor"] * neighbor + C["Energy cost"] * energy)
+        probs.append(1 / (1 + np.exp(-Z)))
+    return np.array(probs)
+
+
+def _wip_run_all_tracts(df, building_age, upfront_cost_range, energy_cost_range, concern, neighbor, n_runs=1000):
+    results = {}
+    bar = st.progress(0)
+    status = st.empty()
+    total = len(df.index)
+    for i, label in enumerate(df.index):
+        status.text(f"Processing {label}… ({i + 1}/{total})")
+        try:
+            probs = _wip_run_simulation(df.loc[label], building_age, upfront_cost_range, energy_cost_range, concern, neighbor, n_runs)
+            results[label] = float(np.mean(probs))
+        except Exception:
+            results[label] = 0.5
+        bar.progress((i + 1) / total)
+    status.text("Simulation complete!")
+    return results
+
+
+def _wip_status_quo(t, max_adoption=0.85):
+    return min(max_adoption, (max_adoption / (2050 - 2024)) * (t - 2024))
+
+
+def _wip_s_curve(t, max_adoption=0.95):
+    tn = (t - 2024) / (2050 - 2024)
+    return max_adoption / (1 + np.exp(-4 * (tn - 0.4)))
+
+
+def _wip_regulatory(t, max_adoption=0.98):
+    return min(max_adoption, 0.05 * np.exp(0.15 * 1.5 * (t - 2024)))
+
+
+def _wip_curve_dict(func, years):
+    return {int(y): float(func(y)) for y in years}
+
+
+def _wip_fill_curve(ranked, adoption_by_year, adopted_set, years_list, curve, n_total):
+    queue = [b for b in ranked if b not in adopted_set]
+    ptr, adopted_so_far = 0, len(adopted_set)
+    for year in years_list:
+        need = max(0, int(n_total * curve.get(year, 0.0)) - adopted_so_far)
+        added = 0
+        while added < need and ptr < len(queue):
+            bid = queue[ptr]; ptr += 1
+            if bid in adopted_set:
+                continue
+            adoption_by_year[bid] = year
+            adopted_set.add(bid)
+            adopted_so_far += 1
+            added += 1
+    return adoption_by_year, adopted_set
+
+
+def _wip_integrate_threshold(prop, curve, years, threshold):
+    n = len(prop)
+    if n == 0:
+        return {}
+    willing = sorted([t for t, p in prop.items() if p >= threshold], key=lambda t: prop[t], reverse=True)
+    r, _ = _wip_fill_curve(willing, {}, set(), years, curve, n)
+    return r
+
+
+def _wip_integrate_ranked(prop, curve, years, floor):
+    n = len(prop)
+    if n == 0:
+        return {}
+    eligible = sorted([t for t, p in prop.items() if p >= floor], key=lambda t: prop[t], reverse=True)
+    r, _ = _wip_fill_curve(eligible, {}, set(), years, curve, n)
+    return r
+
+
+def _wip_integrate_dice(prop, curve, years, rng, floor=0.0):
+    n = len(prop)
+    if n == 0:
+        return {}
+    candidates = {k: float(v) for k, v in prop.items() if v >= floor}
+    all_bids = list(candidates.keys())
+    adopted_set, adoption_by_year, adopted_so_far = set(), {}, 0
+    for year in years:
+        need = max(0, int(n * curve.get(year, 0.0)) - adopted_so_far)
+        if need == 0:
+            continue
+        eligible = [b for b in all_bids if b not in adopted_set]
+        if not eligible:
+            break
+        draws = rng.uniform(0, 1, len(eligible))
+        hits = sorted([b for b, u in zip(eligible, draws) if candidates[b] > u], key=lambda b: candidates[b], reverse=True)
+        for bid in hits[:need]:
+            adoption_by_year[bid] = year
+            adopted_set.add(bid)
+            adopted_so_far += 1
+    return adoption_by_year
+
+
+def _wip_integrate_ensemble(prop, curve, years, n_runs, floor, seed, ci_low=10.0, ci_high=90.0):
+    rng0 = np.random.default_rng(seed)
+    seeds = rng0.integers(0, 2**32, size=n_runs)
+    assignments, rows = [], []
+    for s in seeds:
+        a = _wip_integrate_dice(prop, curve, years, np.random.default_rng(int(s)), floor=floor)
+        assignments.append(a)
+        rows.append(_wip_cumulative_pct(a, years, len(prop)).values)
+    arr = np.stack(rows)
+    return (pd.Series(arr.mean(0), index=years),
+            pd.Series(np.percentile(arr, ci_low, 0), index=years),
+            pd.Series(np.percentile(arr, ci_high, 0), index=years),
+            assignments)
+
+
+def _wip_cumulative_pct(adoption_by_year, years, n_total):
+    counts = {y: 0 for y in years}
+    for y in adoption_by_year.values():
+        if y in counts:
+            counts[y] += 1
+    running, out = 0, []
+    for y in years:
+        running += counts.get(y, 0)
+        out.append(running / n_total * 100 if n_total else 0.0)
+    return pd.Series(out, index=years)
+
+
+def _wip_choropleth(census_df, tract_results, map_data, state_name):
+    center, zoom = _STATE_MAP_CONFIG.get(state_name, ([39.5, -98.4], 4))
+    m = folium.Map(location=center, zoom_start=zoom, tiles="Cartodb Positron")
+    if map_data is None or not tract_results:
+        return m
+    min_p, max_p = min(tract_results.values()), max(tract_results.values())
+
+    def get_color(p):
+        n = (p - min_p) / (max_p - min_p) if max_p > min_p else 0.5
+        return matplotlib.colors.rgb2hex(matplotlib.cm.get_cmap("viridis")(n))
+
+    def style_fn(feature):
+        props = feature["properties"]
+        tract_id = props.get("TRACTCE", props.get("TRACTCE20", ""))
+        county_fp = props.get("COUNTYFP", props.get("COUNTYFP20", ""))
+        label = next(
+            (lbl for lbl in tract_results
+             if lbl.startswith(f"Tract {tract_id},")
+             and "county" in census_df.columns
+             and county_fp in str(census_df.loc[lbl, "county"]).zfill(3)),
+            None,
+        )
+        p = tract_results.get(label, 0) if label else 0
+        feature["properties"]["probability"] = f"{p:.1%}"
+        return {"fillColor": get_color(p), "color": "#000", "weight": 0.8, "fillOpacity": 0.7}
+
+    tract_field = "TRACTCE20" if "TRACTCE20" in map_data.columns else "TRACTCE"
+    folium.GeoJson(
+        map_data, name="Deal Acceptance",
+        style_function=style_fn,
+        tooltip=folium.GeoJsonTooltip(
+            fields=[tract_field, "probability"],
+            aliases=["Tract:", "Acceptance:"],
+            style="background-color:white;color:#333;font-size:12px;padding:8px",
+        ),
+    ).add_to(m)
+    m.get_root().html.add_child(folium.Element(
+        f'<div style="position:fixed;bottom:50px;left:50px;width:210px;height:95px;'
+        f'background:white;border:2px solid grey;z-index:9999;font-size:13px;padding:10px">'
+        f'<b>Deal Acceptance Probability</b><br>'
+        f'<span style="color:#440154">&#9632;</span> Low ({min_p:.1%})<br>'
+        f'<span style="color:#31688e">&#9632;</span> Medium<br>'
+        f'<span style="color:#fde725">&#9632;</span> High ({max_p:.1%})</div>'
+    ))
+    return m
+
+
+def _render_wip_explorer_tab() -> None:
+    st.markdown("## National Retrofit Deal Acceptance Simulator")
+    st.markdown(
+        "Select any US state to run the Monte Carlo logit simulation across its census tracts. "
+        "**Massachusetts** uses a bundled local CSV; other states use the Census ACS 5-year API (2023)."
+    )
+
+    # ── Parameters panel ──────────────────────────────────────────────────────
+    with st.expander("Scenario & behavioural parameters", expanded=True):
+        p_col1, p_col2, p_col3 = st.columns(3)
+        with p_col1:
+            st.markdown("**State & retrofit scenario**")
+            selected_state = st.selectbox(
+                "State", options=list(_US_STATES.keys()),
+                index=list(_US_STATES.keys()).index("Massachusetts"),
+                key="wip_state",
+            )
+            building_age = st.number_input(
+                "Building age (years since built)", min_value=0, max_value=200, value=50, step=5,
+                key="wip_age",
+            )
+            cost_min, cost_max = st.select_slider(
+                "Upfront cost range (k$)",
+                options=list(np.arange(0, 101, 5)),
+                value=(10, 40),
+                key="wip_cost",
+            )
+            energy_min, energy_max = st.select_slider(
+                "Perceived annual energy savings range (hundreds $)",
+                options=[round(x, 1) for x in np.arange(0, 11, 0.5)],
+                value=(0.0, 10.0),
+                key="wip_energy",
+            )
+        with p_col2:
+            st.markdown("**Behavioural** _(not in census data)_")
+            concern_level = st.slider("Environmental concern (1=Low, 5=High)", 1, 5, 3, key="wip_concern")
+            neighbor_effect = st.slider("Neighbour adoption influence (1=Low, 5=High)", 1, 5, 3, key="wip_neighbor")
+        with p_col3:
+            st.markdown("**Run options**")
+            st.caption("Pick a single census tract below, or run across the entire state.")
+
+    state_fips = _US_STATES[selected_state]
+
+    # ── Load census data ───────────────────────────────────────────────────────
+    if selected_state == "Massachusetts" and _MA_CENSUS_CSV.is_file():
+        with st.spinner("Loading Massachusetts census tracts…"):
+            df = _wip_load_ma_census(str(_MA_CENSUS_CSV))
+        if df is None:
+            st.error(f"Could not read {_MA_CENSUS_CSV}")
+            return
+    else:
+        with st.spinner(f"Loading census data for {selected_state} from ACS API…"):
+            raw_df = _wip_fetch_census(state_fips)
+        if raw_df is None:
+            st.error("Failed to load census data. Check network connection.")
+            return
+        with st.spinner("Loading county names…"):
+            county_names = _wip_fetch_county_names(state_fips)
+        df = _wip_build_display_df(raw_df, county_names)
+
+    n_tracts = len(df)
+    n_counties = df["county_name"].nunique() if "county_name" in df.columns else "?"
+    m1, m2 = st.columns(2)
+    m1.metric("Census Tracts", f"{n_tracts:,}")
+    m2.metric("Counties", f"{n_counties}")
+
+    # ── Single-tract selector + run buttons ───────────────────────────────────
+    sorted_tracts = sorted(df.index.unique())
+    st.divider()
+    tc1, tc2, tc3 = st.columns([3, 1, 1])
+    with tc1:
+        selected_tract = st.selectbox("Census tract for single-tract simulation:", sorted_tracts, key="wip_tract")
+    with tc2:
+        run_single = st.button("Run single tract (10k draws)", type="primary", key="wip_run_single")
+    with tc3:
+        run_all = st.button("Run all tracts statewide (1k draws each)", type="secondary", key="wip_run_all")
+
+    # ── Single-tract result ────────────────────────────────────────────────────
+    if run_single:
+        tract_data = df.loc[selected_tract]
+        with st.spinner(f"Running 10,000 simulations for {selected_tract}…"):
+            probs = _wip_run_simulation(
+                tract_data, building_age, (cost_min, cost_max),
+                (energy_min, energy_max), concern_level, neighbor_effect,
+            )
+        mean_p = np.mean(probs)
+        st.markdown(f"#### Results for {selected_tract}")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Mean probability", f"{mean_p:.2%}")
+        r2.metric("Median probability", f"{np.median(probs):.2%}")
+        r3.metric("Std deviation", f"{np.std(probs):.3f}")
+
+        fig1, ax1 = plt.subplots(figsize=(10, 4))
+        ax1.hist(probs, bins=50, density=True, color="skyblue", edgecolor="black")
+        ax1.axvline(mean_p, color="red", linestyle="--", label=f"Mean: {mean_p:.2%}")
+        ax1.set_title("Distribution of Deal Acceptance Probabilities")
+        ax1.set_xlabel("Probability of accepting deal")
+        ax1.set_ylabel("Density")
+        ax1.legend()
+        st.pyplot(fig1)
+        plt.close(fig1)
+
+        fig2, ax2 = plt.subplots(figsize=(10, 4))
+        ax2.plot(np.sort(probs), np.arange(len(probs)) / len(probs))
+        ax2.set_title("CDF of Deal Acceptance Probabilities")
+        ax2.set_xlabel("Probability")
+        ax2.set_ylabel("Cumulative probability")
+        ax2.grid(True, linestyle=":")
+        st.pyplot(fig2)
+        plt.close(fig2)
+
+    # ── Statewide result ───────────────────────────────────────────────────────
+    if run_all:
+        with st.spinner(f"Downloading {selected_state} shapefile…"):
+            map_data = _wip_fetch_shapefile(state_fips)
+
+        st.markdown(f"#### Statewide Analysis — {selected_state}")
+        tract_results = _wip_run_all_tracts(
+            df, building_age, (cost_min, cost_max),
+            (energy_min, energy_max), concern_level, neighbor_effect,
+        )
+        st.session_state["wip_tract_results"] = tract_results
+        st.session_state["wip_tract_state"] = selected_state
+        st.session_state["wip_sim_params"] = {
+            "building_age": building_age, "cost_range": (cost_min, cost_max),
+            "energy_range": (energy_min, energy_max),
+            "concern_level": concern_level, "neighbor_effect": neighbor_effect,
+        }
+
+        all_p = list(tract_results.values())
+        min_p, max_p = min(all_p), max(all_p)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Mean", f"{np.mean(all_p):.2%}")
+        s2.metric("Median", f"{np.median(all_p):.2%}")
+        s3.metric("Min", f"{min_p:.2%}")
+        s4.metric("Max", f"{max_p:.2%}")
+
+        fig_d, ax_d = plt.subplots(figsize=(12, 5))
+        ax_d.hist(all_p, bins=30, density=True, color="lightblue", edgecolor="navy", alpha=0.7)
+        ax_d.axvline(np.mean(all_p), color="red", linestyle="--", linewidth=2, label=f"Mean: {np.mean(all_p):.2%}")
+        ax_d.axvline(np.median(all_p), color="orange", linestyle="--", linewidth=2, label=f"Median: {np.median(all_p):.2%}")
+        kde = stats.gaussian_kde(all_p)
+        xr = np.linspace(min_p, max_p, 200)
+        ax_d.plot(xr, kde(xr), "r-", linewidth=2, label="KDE")
+        ax_d.set_title(f"Distribution — {selected_state} Census Tracts", fontsize=14, fontweight="bold")
+        ax_d.set_xlabel("Probability of accepting deal")
+        ax_d.set_ylabel("Density")
+        ax_d.legend()
+        ax_d.grid(True, alpha=0.3)
+        ax_d.text(0.02, 0.98,
+                  f"Std: {np.std(all_p):.3f}\n25th: {np.percentile(all_p, 25):.2%}\n75th: {np.percentile(all_p, 75):.2%}",
+                  transform=ax_d.transAxes, va="top",
+                  bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8), fontsize=10)
+        plt.tight_layout()
+        st.pyplot(fig_d)
+        plt.close(fig_d)
+
+        # Choropleth map
+        st.markdown("**Choropleth Map**")
+        if map_data is not None:
+            try:
+                cmap_fig = _wip_choropleth(df, tract_results, map_data, selected_state)
+                st_folium(cmap_fig, width=900, height=600, returned_objects=[])
+            except Exception as exc:
+                st.warning(f"Map error: {exc}")
+        else:
+            st.info("Shapefile could not be loaded — choropleth unavailable.")
+
+        # Top / bottom tracts
+        res_s = pd.Series(tract_results, name="Mean acceptance probability")
+        t1, t2 = st.columns(2)
+        with t1:
+            st.markdown("**Top 10 tracts**")
+            st.dataframe(res_s.sort_values(ascending=False).head(10).map("{:.2%}".format))
+        with t2:
+            st.markdown("**Bottom 10 tracts**")
+            st.dataframe(res_s.sort_values(ascending=True).head(10).map("{:.2%}".format))
+
+        export_df = pd.DataFrame({
+            "tract": list(tract_results.keys()),
+            "mean_acceptance_probability": list(tract_results.values()),
+        })
+        st.download_button(
+            "Download results as CSV",
+            export_df.to_csv(index=False),
+            f"{selected_state.lower().replace(' ', '_')}_acceptance.csv", "text/csv",
+        )
+
+    # ── Adoption rate analysis ─────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Adoption Rate Analysis")
+    st.caption("Requires statewide results — click 'Run all tracts statewide' above first.")
+
+    years_list = list(range(2024, 2051))
+    years_np = np.arange(2024, 2051)
+
+    adopt_col1, adopt_col2 = st.columns([2, 1])
+    with adopt_col1:
+        adoption_scenario = st.selectbox(
+            "Adoption scenario",
+            ["Status Quo", "Disruptive Technology (S-Curve)", "Regulatory (Rapid Uptake)"],
+            key="wip_adopt_scenario",
+        )
+        integration_method = st.selectbox(
+            "Propensity integration method",
+            ["set_threshold", "dice_roll", "ranked_distribution", "mc_ensemble"],
+            format_func=lambda x: {
+                "set_threshold": "M1: set threshold (willing pool + rank fill)",
+                "dice_roll": "M2: dice roll (stochastic candidates + rank fill)",
+                "ranked_distribution": "M3: ranked distribution (soft floor + deterministic)",
+                "mc_ensemble": "M4: MC ensemble (dice roll repeated; mean + P10–P90 band)",
+            }[x],
+            key="wip_adopt_method",
+        )
+    with adopt_col2:
+        threshold_pct = st.slider("M1 threshold (%)", 50, 95, 75, 5,
+                                   disabled=(integration_method != "set_threshold"), key="wip_thresh")
+        floor_pct = st.slider("M2/M3/M4 floor (%)", 0, 40, 10,
+                               disabled=(integration_method not in ("dice_roll", "ranked_distribution", "mc_ensemble")),
+                               key="wip_floor")
+        n_ensemble = st.slider("M4 ensemble runs", 20, 300, 100, 10,
+                                disabled=(integration_method != "mc_ensemble"), key="wip_ens")
+
+    # Adoption curve reference chart
+    fig_ac, ax_ac = plt.subplots(figsize=(10, 4))
+    ax_ac.plot(years_np, [_wip_status_quo(y) for y in years_np], color="#440154", lw=2, label="Status Quo", marker="o", ms=3)
+    ax_ac.plot(years_np, [_wip_s_curve(y) for y in years_np], color="#31688e", lw=2, label="S-Curve", marker="s", ms=3)
+    ax_ac.plot(years_np, [_wip_regulatory(y) for y in years_np], color="#35b779", lw=2, label="Regulatory", marker="^", ms=3)
+    ax_ac.set_title("Adoption scenarios (2024–2050)")
+    ax_ac.set_ylim(0, 1)
+    ax_ac.set_xlabel("Year")
+    ax_ac.set_ylabel("Adoption rate")
+    ax_ac.legend()
+    ax_ac.grid(True, alpha=0.3)
+    plt.tight_layout()
+    st.pyplot(fig_ac)
+    plt.close(fig_ac)
+
+    if st.button("Calculate adoption rates by census tract", type="primary", key="wip_calc_adopt"):
+        if "wip_tract_results" not in st.session_state:
+            st.error("Run **all tracts (statewide)** first to generate propensity scores.")
+        elif st.session_state.get("wip_tract_state") != selected_state:
+            st.error("Stored results are for a different state — re-run statewide for this state.")
+        else:
+            tract_prop = {k: float(v) for k, v in st.session_state["wip_tract_results"].items()}
+            n_tot = len(tract_prop)
+            func_map = {
+                "Status Quo": _wip_status_quo,
+                "Disruptive Technology (S-Curve)": _wip_s_curve,
+                "Regulatory (Rapid Uptake)": _wip_regulatory,
+            }
+            curve = _wip_curve_dict(func_map[adoption_scenario], years_list)
+            thr, fl = threshold_pct / 100, floor_pct / 100
+
+            with st.spinner("Running propensity integration…"):
+                ensemble_lo = ensemble_hi = None
+                if integration_method == "set_threshold":
+                    aby = _wip_integrate_threshold(tract_prop, curve, years_list, thr)
+                    aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
+                elif integration_method == "dice_roll":
+                    aby = _wip_integrate_dice(tract_prop, curve, years_list, np.random.default_rng(42), floor=fl)
+                    aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
+                elif integration_method == "ranked_distribution":
+                    aby = _wip_integrate_ranked(tract_prop, curve, years_list, fl)
+                    aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
+                else:
+                    aggregate_pct, ensemble_lo, ensemble_hi, _ = _wip_integrate_ensemble(
+                        tract_prop, curve, years_list, n_ensemble, fl, seed=0)
+
+            fig_ar, ax_ar = plt.subplots(figsize=(12, 5))
+            ax_ar.plot(years_list, aggregate_pct, color="#2563eb", lw=2.5, label="Cumulative adoption %")
+            if ensemble_lo is not None:
+                ax_ar.fill_between(years_list, ensemble_lo, ensemble_hi, alpha=0.2, color="#2563eb", label="P10–P90")
+            ax_ar.set_title(
+                f"Cumulative Adoption — {selected_state} | {adoption_scenario} | {integration_method}",
+                fontsize=13, fontweight="bold",
+            )
+            ax_ar.set_xlabel("Year")
+            ax_ar.set_ylabel("% of tracts adopted")
+            ax_ar.set_ylim(0, 100)
+            ax_ar.legend()
+            ax_ar.grid(True, alpha=0.3)
+            plt.tight_layout()
+            st.pyplot(fig_ar)
+            plt.close(fig_ar)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1185,12 +1980,13 @@ def main() -> None:
         "energy simulation output from [globi](https://github.com/globi)."
     )
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "1 · Upload Data",
         "2 · Configure",
         "3 · Adoption Curves",
         "4 · Emissions",
         "5 · Run & Results",
+        "WIP Explorer",
     ])
 
     with tab1:
@@ -1203,6 +1999,8 @@ def main() -> None:
         _render_emissions_tab()
     with tab5:
         _render_results_tab()
+    with tab6:
+        _render_wip_explorer_tab()
 
 
 if __name__ == "__main__":
