@@ -15,6 +15,7 @@ dependencies = [
     "folium>=0.16.0",
     "geopandas>=0.14.0",
     "streamlit-folium>=0.20.0",
+    "pydantic>=2.0.0",
 ]
 
 [build-system]

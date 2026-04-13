@@ -1,6 +1,6 @@
 # globi-use-cases
 
-Tools and a Streamlit app for **willingness-to-pay (WTP)**, **retrofit adoption**, and **emissions** analysis on [globi](https://github.com/globi)-style building energy outputs (`EnergyAndPeak.pq` parquets).
+Tools and a Streamlit app for **willingness-to-pay (WTP)**, **retrofit adoption**, and **emissions** analysis on [globi](https://github.com/globi)-style building energy outputs (view the documentation for globi to see what generating this entails).
 
 ## What this repo does
 

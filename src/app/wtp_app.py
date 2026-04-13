@@ -31,6 +31,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+from pydantic import BaseModel, Field
 
 import folium
 import geopandas as gpd
@@ -59,15 +60,53 @@ _EMISSIONS_PATH = _DATA_DIR / "emissions_trajectories.json"
 _YEARS_RANGE = list(range(2024, 2101))
 _PROJECTION_YEARS = list(range(2025, 2101))
 
-# ── Page config ────────────────────────────────────────────────────────────────
+# Income tiers for incentive UI — maps display label → list of INCOME_CATEGORIES_K values
+# that fall in that tier (midpoints in k$, matching apply_propensity.INCOME_CATEGORIES)
+_INCOME_TIERS: list[tuple[str, list[float]]] = [
+    ("< $30k  (Very Low Income)",  [5.0, 12.5, 17.5, 22.5, 27.5]),
+    ("$30k–$50k  (Low Income)",    [32.5, 37.5, 42.5, 47.5]),
+    ("$50k–$80k  (Moderate)",      [55.0, 67.5]),
+    ("$80k–$150k  (Middle)",       [87.5, 112.5, 137.5]),
+    ("> $150k  (Higher Income)",   [175.0, 225.0]),
+]
+
+
+class IncentiveConfig(BaseModel):
+    """Income-stratified incentive amounts (USD) subtracted from retrofit cost per MC sample."""
+
+    very_low_income: float = Field(0.0, ge=0.0, description="Incentive for < $30k households (USD)")
+    low_income: float = Field(0.0, ge=0.0, description="Incentive for $30k–$50k households (USD)")
+    moderate_income: float = Field(0.0, ge=0.0, description="Incentive for $50k–$80k households (USD)")
+    middle_income: float = Field(0.0, ge=0.0, description="Incentive for $80k–$150k households (USD)")
+    higher_income: float = Field(0.0, ge=0.0, description="Incentive for > $150k households (USD)")
+
+    def to_income_map(self) -> dict[float, float]:
+        """Map each INCOME_CATEGORIES value to its incentive amount in USD."""
+        tier_amounts = [
+            self.very_low_income,
+            self.low_income,
+            self.moderate_income,
+            self.middle_income,
+            self.higher_income,
+        ]
+        result: dict[float, float] = {}
+        for (_, income_vals), amount in zip(_INCOME_TIERS, tier_amounts):
+            for iv in income_vals:
+                result[iv] = amount
+        return result
+
+
+def _build_income_incentive_map() -> dict[float, float]:
+    """Return {income_k_usd: incentive_usd} from the current IncentiveConfig in session_state."""
+    cfg: IncentiveConfig = st.session_state.get("incentive_config", IncentiveConfig())
+    return cfg.to_income_map()
+
 st.set_page_config(
     page_title="WTP & Adoption Analysis | globi",
-    page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# ── Session state defaults ─────────────────────────────────────────────────────
 _STATE_DEFAULTS: dict = {
     # {year: {"baseline": bytes, "scenario": bytes}} — one pair per simulated year
     "year_files": {},
@@ -84,7 +123,6 @@ for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── Example data preload ───────────────────────────────────────────────────────
 _EXAMPLE_BASELINE = _DATA_DIR / "globi_outputs" / "split" / "Baseline_EnergyAndPeak.pq"
 _EXAMPLE_SCENARIO = _DATA_DIR / "globi_outputs" / "split" / "ASHP_EnergyAndPeak.pq"
 _EXAMPLE_YEAR = 2025
@@ -104,9 +142,6 @@ if (
     st.session_state["n_years"] = 1
     st.session_state["scenario_name"] = "ASHP"
     st.session_state["_example_preloaded"] = True
-
-
-# ── JSON loaders ───────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
 def _load_adoption_curves() -> dict:
@@ -132,7 +167,6 @@ def _save_emissions_json(data: dict) -> None:
     st.cache_data.clear()
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _preview_parquet(file_bytes: bytes) -> dict:
     """Return quick stats from an uploaded EnergyAndPeak.pq."""
@@ -159,10 +193,6 @@ def _curve_colors() -> list[str]:
     return ["#2563eb", "#16a34a", "#dc2626", "#9333ea", "#ea580c", "#0891b2"]
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TAB 1 — DATA UPLOAD
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _render_upload_tab() -> None:
     st.markdown("## Step 1 — Upload Energy Data")
     st.markdown(
@@ -172,17 +202,14 @@ def _render_upload_tab() -> None:
         "WTP scoring; adoption and emissions are projected forward analytically."
     )
 
-    # ── Example data notice ────────────────────────────────────────────────────
     if st.session_state.get("_example_preloaded"):
         st.info(
             "**Example data pre-loaded** — `Baseline_EnergyAndPeak.pq` and "
             "`ASHP_EnergyAndPeak.pq` from `data/inputs/globi_outputs/split/` are "
             "ready to use. Jump straight to **5 · Run & Results** to see the full "
-            "pipeline, or upload your own files below to replace them.",
-            icon="ℹ️",
+            "pipeline, or upload your own files below to replace them."
         )
 
-    # ── Scenario name + number of years ───────────────────────────────────────
     hdr_col1, hdr_col2, _ = st.columns([2, 1, 3])
     with hdr_col1:
         scenario_name = st.text_input(
@@ -319,7 +346,45 @@ def _render_config_tab() -> None:
 
     st.divider()
 
-    # ── Energy prices ──────────────────────────────────────────────────────────
+    # ── Incentives ─────────────────────────────────────────────────────────────
+    st.markdown("### Incentives")
+    incentives_enabled = st.toggle(
+        "Enable income-based incentives",
+        value=st.session_state.get("incentives_enabled", False),
+        key="cfg_incentives_enabled",
+        help="When enabled, the pipeline runs twice — once without and once with the incentive applied — and results are shown side by side.",
+    )
+    st.session_state["incentives_enabled"] = incentives_enabled
+
+    if incentives_enabled:
+        st.caption(
+            "Set a flat incentive amount (USD) per income tier. Each MC sample draws a household income "
+            "from the census distribution; the matching tier's incentive is subtracted from the retrofit "
+            "cost for that sample only. The net cost is clamped at $0."
+        )
+        existing: IncentiveConfig = st.session_state.get("incentive_config", IncentiveConfig())
+        _TIER_FIELDS = [
+            ("< $30k  (Very Low Income)", "very_low_income"),
+            ("$30k–$50k  (Low Income)", "low_income"),
+            ("$50k–$80k  (Moderate)", "moderate_income"),
+            ("$80k–$150k  (Middle)", "middle_income"),
+            ("> $150k  (Higher Income)", "higher_income"),
+        ]
+        tier_cols = st.columns(len(_TIER_FIELDS))
+        new_values: dict[str, float] = {}
+        for col, (label, field) in zip(tier_cols, _TIER_FIELDS):
+            with col:
+                new_values[field] = st.number_input(
+                    label,
+                    min_value=0.0,
+                    value=float(getattr(existing, field)),
+                    step=500.0, format="%.0f",
+                    key=f"inc_tier_{field}",
+                )
+        st.session_state["incentive_config"] = IncentiveConfig(**new_values)
+
+    st.divider()
+
     st.markdown("### Energy Prices")
     st.caption("Used to convert kWh to annual energy cost (USD) for the WTP model.")
     prices: dict[str, float] = st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES))
@@ -440,6 +505,124 @@ def _render_config_tab() -> None:
         )
     for k, v in [("n_mc_samples", n_mc), ("n_ensemble_runs", n_ensemble), ("random_seed", seed)]:
         st.session_state[k] = int(v)
+
+    st.divider()
+
+    # ── Census tract confirmation ──────────────────────────────────────────────
+    st.markdown("### Census Tract Confirmation")
+    if not is_us:
+        st.info("Census tract lookup is only available for US buildings.")
+    else:
+        _render_census_tract_lookup()
+
+
+def _render_census_tract_lookup() -> None:
+    year_files = st.session_state.get("year_files", {})
+    selected_years = st.session_state.get("selected_years", [])
+    ref_years = [y for y in sorted(selected_years) if year_files.get(y, {}).get("baseline")]
+
+    if not ref_years:
+        st.info("Upload a baseline file in Step 1 to look up the census tract.")
+        return
+
+    ref_yr = ref_years[0]
+    if st.button("Look up census tract from building coordinates", key="cfg_lookup_tract"):
+        with st.spinner("Calling Census Geocoder API…"):
+            try:
+                from app.analysis.census_lookup import geocode_point
+                import geopandas as gpd
+                from shapely import wkt as shapely_wkt
+
+                base_flat = load_energy_parquet(year_files[ref_yr]["baseline"])
+
+                # Try rotated_rectangle WKT (EPSG:3857) first
+                rect_col = next(
+                    (c for c in ["rotated_rectangle", "GLOBI_ROTATED_RECTANGLE",
+                                 "feature.geometry.rotated_rectangle"]
+                     if c in base_flat.columns),
+                    None,
+                )
+
+                building_lats: list[float] = []
+                building_lons: list[float] = []
+
+                if rect_col is not None:
+                    wkt_series = base_flat[rect_col].dropna().astype(str)
+                    geoms = wkt_series.map(lambda s: shapely_wkt.loads(s))
+                    gs = gpd.GeoSeries(geoms, crs="EPSG:3857").to_crs("EPSG:4326")
+                    centroids = gs.centroid
+                    building_lons = centroids.x.tolist()
+                    building_lats = centroids.y.tolist()
+                else:
+                    # Fall back to direct lat/lon columns
+                    lat_col = next(
+                        (c for c in ["lat", "feature.location.lat"] if c in base_flat.columns),
+                        None,
+                    )
+                    lon_col = next(
+                        (c for c in ["lon", "feature.location.lon"] if c in base_flat.columns),
+                        None,
+                    )
+                    if lat_col and lon_col:
+                        building_lats = pd.to_numeric(base_flat[lat_col], errors="coerce").dropna().tolist()
+                        building_lons = pd.to_numeric(base_flat[lon_col], errors="coerce").dropna().tolist()
+
+                if building_lats and building_lons:
+                    centroid_lat = float(sum(building_lats) / len(building_lats))
+                    centroid_lon = float(sum(building_lons) / len(building_lons))
+                    tract_info = geocode_point(centroid_lat, centroid_lon)
+                    st.session_state["census_tract_info"] = {
+                        "tract": tract_info,
+                        "centroid_lat": centroid_lat,
+                        "centroid_lon": centroid_lon,
+                        "building_lats": building_lats,
+                        "building_lons": building_lons,
+                        "n_buildings": len(base_flat),
+                    }
+                else:
+                    st.warning(
+                        "No rotated_rectangle or lat/lon columns found in the uploaded baseline file."
+                    )
+            except Exception as exc:
+                st.error(f"Census tract lookup failed: {exc}")
+
+    tract_data = st.session_state.get("census_tract_info")
+    if tract_data and tract_data.get("tract"):
+        t = tract_data["tract"]
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Census Tract GEOID", t.geoid or "—")
+        col2.metric("State FIPS", t.state or "—")
+        col3.metric("County FIPS", t.county or "—")
+        st.caption(
+            f"Centroid of {tract_data['n_buildings']} buildings: "
+            f"({tract_data['centroid_lat']:.4f}°N, {tract_data['centroid_lon']:.4f}°W)"
+        )
+        m = folium.Map(
+            location=[tract_data["centroid_lat"], tract_data["centroid_lon"]],
+            zoom_start=12,
+        )
+        # Plot individual building centroids when available
+        bldg_lats = tract_data.get("building_lats", [])
+        bldg_lons = tract_data.get("building_lons", [])
+        _MAX_MARKERS = 500
+        for blat, blon in zip(bldg_lats[:_MAX_MARKERS], bldg_lons[:_MAX_MARKERS]):
+            folium.CircleMarker(
+                [blat, blon],
+                radius=4,
+                color="#2563EB",
+                fill=True,
+                fill_opacity=0.6,
+                tooltip="Building",
+            ).add_to(m)
+        # Always add a distinct centroid marker
+        folium.Marker(
+            [tract_data["centroid_lat"], tract_data["centroid_lon"]],
+            tooltip=f"Centroid — Tract {t.geoid}",
+            icon=folium.Icon(color="red", icon="home"),
+        ).add_to(m)
+        st_folium(m, height=350, use_container_width=True)
+    elif tract_data and tract_data.get("tract") is None:
+        st.warning("Census Geocoder returned no result for the building centroid coordinates.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -770,28 +953,37 @@ def _render_results_tab() -> None:
 def _run_pipeline(simulated_years: list[int]) -> None:
     progress = st.progress(0, text="Starting…")
     year_files: dict = st.session_state["year_files"]
-    ref_year = simulated_years[0]  # earliest year — reference for per-building WTP
 
-    # ── 1. Build policy_impacts from the reference (earliest) simulated year ──
-    progress.progress(5, text=f"Computing energy savings (reference year {ref_year})…")
-    try:
-        entry = year_files[ref_year]
-        base_flat = load_energy_parquet(entry["baseline"])
-        scen_flat = load_energy_parquet(entry["scenario"])
-        policy_impacts = build_policy_impacts(
-            baseline_df=base_flat,
-            scenario_df=scen_flat,
-            scenario_name=st.session_state["scenario_name"],
-            cost_per_sqm=float(st.session_state.get("cost_per_sqm", 150.0)),
-            energy_prices=st.session_state.get("energy_prices"),
-        )
-    except Exception as exc:
-        st.error(f"Energy delta failed for {ref_year}: {exc}")
-        return
+    # ── 1. Build policy_impacts (ref year) and per-year energy data ───────────
+    progress.progress(5, text=f"Computing energy savings across {len(simulated_years)} year(s)…")
+    year_energy_data: dict = {}
+    policy_impacts = None
+
+    for yr_idx, yr in enumerate(simulated_years):
+        try:
+            entry = year_files[yr]
+            base_flat = load_energy_parquet(entry["baseline"])
+            scen_flat = load_energy_parquet(entry["scenario"])
+            pi = build_policy_impacts(
+                baseline_df=base_flat,
+                scenario_df=scen_flat,
+                scenario_name=st.session_state["scenario_name"],
+                cost_per_sqm=float(st.session_state.get("cost_per_sqm", 150.0)),
+                energy_prices=st.session_state.get("energy_prices"),
+            )
+            kwh_cols = [c for c in pi.columns if "_kwh_" in c]
+            year_energy_data[yr] = pi.set_index("building.id")[kwh_cols]
+            if yr_idx == 0:
+                policy_impacts = pi
+        except Exception as exc:
+            st.error(f"Energy delta failed for {yr}: {exc}")
+            if yr_idx == 0:
+                return
 
     st.session_state["policy_impacts"] = policy_impacts
+    st.session_state["year_energy_data"] = year_energy_data
     st.session_state["simulated_years"] = simulated_years
-    progress.progress(25, text=f"Energy savings computed for {len(policy_impacts)} buildings.")
+    progress.progress(25, text=f"Energy savings computed for {len(policy_impacts)} buildings across {len(year_energy_data)} year(s).")
 
     # ── 2. Census enrichment (US only) ───────────────────────────────────────
     if st.session_state.get("is_us", True) and st.session_state.get("census_csv_bytes") is None:
@@ -806,10 +998,10 @@ def _run_pipeline(simulated_years: list[int]) -> None:
             )
             st.session_state["policy_impacts"] = policy_impacts
 
-    # ── 3. Propensity model ───────────────────────────────────────────────────
-    progress.progress(40, text="Running WTP propensity model (MC ensemble)…")
+    # ── 3. Propensity model (base — no incentive) ─────────────────────────────
+    progress.progress(40, text="Running WTP propensity model (base)…")
+    census_path = None
     try:
-        census_path = None
         if st.session_state.get("census_csv_bytes"):
             import tempfile, os
             tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
@@ -823,45 +1015,136 @@ def _run_pipeline(simulated_years: list[int]) -> None:
             n_monte_carlo_samples=int(st.session_state.get("n_mc_samples", 100)),
             random_seed=int(st.session_state.get("random_seed", 42)),
         )
-
         if not st.session_state.get("is_us", True):
-            # Apply user-specified priors by injecting synthetic distributions
             _apply_non_us_priors(propensity_engine)
-
         propensity_result = propensity_engine.calculate_all_probabilities()
         st.session_state["propensity_result"] = propensity_result
-        if census_path:
-            os.unlink(census_path)
     except Exception as exc:
         st.error(f"Propensity model failed: {exc}")
         return
-    progress.progress(65, text="Propensity model complete.")
+    finally:
+        if census_path:
+            import os
+            os.unlink(census_path)
 
-    # Join acceptance_probability into policy_impacts so the emissions calculation
-    # can rank buildings by propensity and correctly propagate MC uncertainty.
-    if "building.id" in propensity_result.data.columns and "building.id" in policy_impacts.columns:
-        prop_scores = propensity_result.data[["building.id", "acceptance_probability"]].drop_duplicates("building.id")
-        policy_impacts = policy_impacts.merge(prop_scores, on="building.id", how="left")
-        st.session_state["policy_impacts"] = policy_impacts
+    # Join scores into policy_impacts for propensity-ranked emissions
+    policy_impacts = _join_propensity_scores(policy_impacts, propensity_result)
+    st.session_state["policy_impacts"] = policy_impacts
+    progress.progress(55, text="Base propensity complete.")
 
-    # ── 4 & 5. Uptake + emissions for every adoption scenario ─────────────────
+    # ── 3b. Propensity model (with incentive) — optional ──────────────────────
+    incentives_enabled = st.session_state.get("incentives_enabled", False)
+    propensity_result_inc = None
+    policy_impacts_inc = None
+
+    if incentives_enabled:
+        progress.progress(56, text="Running propensity model with incentives…")
+        try:
+            incentive_map = _build_income_incentive_map()
+            propensity_engine_inc = PropensityModelEngine(
+                policy_impacts_df=st.session_state["policy_impacts"].drop(
+                    columns=["acceptance_probability"], errors="ignore"
+                ),
+                census_data_path=None,
+                n_monte_carlo_samples=int(st.session_state.get("n_mc_samples", 100)),
+                random_seed=int(st.session_state.get("random_seed", 42)),
+                incentive_by_income=incentive_map,
+            )
+            if not st.session_state.get("is_us", True):
+                _apply_non_us_priors(propensity_engine_inc)
+            # Re-use tract distributions from base engine to avoid redundant census calls
+            propensity_engine_inc.tract_distributions = propensity_engine.tract_distributions
+            propensity_engine_inc.county_concern = propensity_engine.county_concern
+            propensity_result_inc = propensity_engine_inc.calculate_all_probabilities()
+            policy_impacts_inc = _join_propensity_scores(
+                st.session_state["policy_impacts"].drop(columns=["acceptance_probability"], errors="ignore"),
+                propensity_result_inc,
+            )
+            st.session_state["propensity_result_incentive"] = propensity_result_inc
+        except Exception as exc:
+            st.warning(f"Incentive propensity model failed: {exc}")
+            incentives_enabled = False
+
+    # ── 4 & 5. Uptake + emissions ─────────────────────────────────────────────
     start_yr = int(st.session_state.get("proj_start_year", 2025))
     end_yr = int(st.session_state.get("proj_end_year", 2050))
     projection_years = list(range(start_yr, end_yr + 1))
     emissions_json = _load_emissions_json()
-
     raw_curves = _load_adoption_curves()
     all_adoption_scenarios = list(raw_curves.get("scenarios", {}).keys())
     if not all_adoption_scenarios:
         st.error("No adoption curve scenarios found. Define them in Step 3.")
         return
 
+    progress.progress(60, text=f"Projecting {len(all_adoption_scenarios)} adoption scenario(s)…")
+    scenario_results = _run_adoption_emissions_loop(
+        propensity_result=propensity_result,
+        policy_impacts=policy_impacts,
+        all_adoption_scenarios=all_adoption_scenarios,
+        start_yr=start_yr, end_yr=end_yr,
+        projection_years=projection_years,
+        emissions_json=emissions_json,
+        progress_range=(60, 80),
+        progress_bar=progress,
+    )
+    if not scenario_results:
+        st.error("All adoption scenarios failed — check inputs.")
+        return
+    st.session_state["scenario_results"] = scenario_results
+
+    if incentives_enabled and propensity_result_inc is not None:
+        progress.progress(80, text="Projecting incentive adoption scenarios…")
+        scenario_results_inc = _run_adoption_emissions_loop(
+            propensity_result=propensity_result_inc,
+            policy_impacts=policy_impacts_inc,
+            all_adoption_scenarios=all_adoption_scenarios,
+            start_yr=start_yr, end_yr=end_yr,
+            projection_years=projection_years,
+            emissions_json=emissions_json,
+            progress_range=(80, 98),
+            progress_bar=progress,
+        )
+        st.session_state["scenario_results_incentive"] = scenario_results_inc
+    else:
+        st.session_state["scenario_results_incentive"] = None
+
+    progress.progress(100, text="Done.")
+    st.session_state["run_complete"] = True
+    n_inc = " + incentive variant" if incentives_enabled else ""
+    st.success(f"Analysis complete — {len(scenario_results)} adoption scenario(s){n_inc} projected.")
+    st.rerun()
+
+
+def _join_propensity_scores(policy_impacts: pd.DataFrame, propensity_result) -> pd.DataFrame:
+    """Merge acceptance_probability from propensity result into policy_impacts."""
+    if "building.id" in propensity_result.data.columns and "building.id" in policy_impacts.columns:
+        scores = (
+            propensity_result.data[["building.id", "acceptance_probability"]]
+            .drop_duplicates("building.id")
+        )
+        return policy_impacts.merge(scores, on="building.id", how="left")
+    return policy_impacts
+
+
+def _run_adoption_emissions_loop(
+    propensity_result,
+    policy_impacts: pd.DataFrame,
+    all_adoption_scenarios: list[str],
+    start_yr: int,
+    end_yr: int,
+    projection_years: list[int],
+    emissions_json: dict,
+    progress_range: tuple[int, int],
+    progress_bar,
+) -> dict:
+    """Run uptake + emissions for every adoption scenario. Returns scenario_results dict."""
     scenario_results: dict = {}
     n_scen = len(all_adoption_scenarios)
+    p_lo, p_hi = progress_range
+
     for i, adoption_scenario_name in enumerate(all_adoption_scenarios):
-        pct_start = 70 + int(28 * i / n_scen)
-        pct_end = 70 + int(28 * (i + 1) / n_scen)
-        progress.progress(pct_start, text=f"Projecting '{adoption_scenario_name}' ({i + 1}/{n_scen})…")
+        pct = p_lo + int((p_hi - p_lo) * i / n_scen)
+        progress_bar.progress(pct, text=f"Projecting '{adoption_scenario_name}' ({i + 1}/{n_scen})…")
         try:
             uptake_engine = AdoptionEngine(
                 propensity_df=propensity_result.data,
@@ -884,6 +1167,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 yearly_summary=uptake_result.yearly_summary,
                 emissions_factors_json=emissions_json,
                 years=projection_years,
+                year_energy=st.session_state.get("year_energy_data") or None,
             )
         except Exception as exc:
             st.warning(f"Emissions for '{adoption_scenario_name}' failed: {exc}")
@@ -893,17 +1177,8 @@ def _run_pipeline(simulated_years: list[int]) -> None:
             "uptake": uptake_result,
             "emissions": emissions_df,
         }
-        progress.progress(pct_end)
 
-    if not scenario_results:
-        st.error("All adoption scenarios failed — check inputs.")
-        return
-
-    st.session_state["scenario_results"] = scenario_results
-    progress.progress(100, text="Done.")
-    st.session_state["run_complete"] = True
-    st.success(f"Analysis complete — {len(scenario_results)} adoption scenario(s) projected.")
-    st.rerun()
+    return scenario_results
 
 
 def _apply_non_us_priors(engine: PropensityModelEngine) -> None:
@@ -994,32 +1269,105 @@ def _add_scenario_traces(
     ))
 
 
+# ── Figure builders ────────────────────────────────────────────────────────────
+
+def _build_adoption_fig(scenario_results: dict, simulated_years: list[int]) -> go.Figure:
+    fig = go.Figure()
+    for i, (name, res) in enumerate(scenario_results.items()):
+        ys = res["uptake"].yearly_summary.sort_values("year")
+        if ys.empty:
+            continue
+        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+        years = ys["year"].tolist()
+        mean_s = ys["cumulative_adoption_pct"]
+        p10_s = ys.get("cumulative_adoption_pct_p10") if "cumulative_adoption_pct_p10" in ys.columns else None
+        p90_s = ys.get("cumulative_adoption_pct_p90") if "cumulative_adoption_pct_p90" in ys.columns else None
+        _add_scenario_traces(fig, years, mean_s, p10_s, p90_s, name, line_color, band_rgba)
+    for yr in simulated_years:
+        fig.add_vline(x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
+                      annotation_text=str(yr), annotation_position="top",
+                      annotation_font_size=11, annotation_font_color="#64748b")
+    fig.update_layout(
+        yaxis=dict(title="Cumulative adoption (%)", range=[0, 105]),
+        xaxis_title="Year", height=360,
+        margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.22),
+    )
+    return fig
+
+
+def _build_emissions_fig(scenario_results: dict, first_em: pd.DataFrame, simulated_years: list[int]) -> go.Figure:
+    fig = go.Figure()
+    if not first_em.empty and "baseline_emissions_t" in first_em.columns:
+        fig.add_trace(go.Scatter(
+            x=first_em["year"].tolist(), y=first_em["baseline_emissions_t"].tolist(),
+            mode="lines", name="Baseline (0% adoption)",
+            line=dict(color="#dc2626", width=2.5, dash="dot"),
+        ))
+    for i, (name, res) in enumerate(scenario_results.items()):
+        em = res["emissions"]
+        if em.empty:
+            continue
+        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+        yrs = em["year"].tolist()
+        mean_vals = em["scenario_mean_t"].tolist()
+        lo_vals = em["scenario_p10_t"].tolist() if "scenario_p10_t" in em.columns else [v * 0.90 for v in mean_vals]
+        hi_vals = em["scenario_p90_t"].tolist() if "scenario_p90_t" in em.columns else [v * 1.10 for v in mean_vals]
+        fig.add_trace(go.Scatter(x=yrs, y=lo_vals, mode="lines",
+                                 line=dict(color="rgba(0,0,0,0)"),
+                                 showlegend=False, hoverinfo="skip", legendgroup=name))
+        fig.add_trace(go.Scatter(x=yrs, y=hi_vals, mode="lines",
+                                 line=dict(color="rgba(0,0,0,0)"),
+                                 fill="tonexty", fillcolor=band_rgba,
+                                 showlegend=False, hoverinfo="skip", legendgroup=name))
+        fig.add_trace(go.Scatter(x=yrs, y=mean_vals, mode="lines", name=name,
+                                 line=dict(color=line_color, width=2.5), legendgroup=name))
+    for yr in simulated_years:
+        fig.add_vline(x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
+                      annotation_text=str(yr), annotation_position="top",
+                      annotation_font_size=11, annotation_font_color="#64748b")
+    fig.update_layout(
+        yaxis_title="tCO₂/yr", xaxis_title="Year", height=360,
+        margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.22),
+    )
+    return fig
+
+
+def _first_em(scenario_results: dict) -> pd.DataFrame:
+    return next(
+        (v["emissions"] for v in scenario_results.values() if not v["emissions"].empty),
+        pd.DataFrame(),
+    )
+
+
 # ── Results charts ─────────────────────────────────────────────────────────────
 
 def _render_result_charts() -> None:
     scenario_results: dict = st.session_state["scenario_results"]
+    scenario_results_inc: dict | None = st.session_state.get("scenario_results_incentive")
     propensity_result = st.session_state["propensity_result"]
+    propensity_result_inc = st.session_state.get("propensity_result_incentive")
     policy_impacts: pd.DataFrame = st.session_state["policy_impacts"]
     retrofit_name = st.session_state["scenario_name"]
     simulated_years: list[int] = st.session_state.get("simulated_years", [])
+    incentives_enabled = bool(scenario_results_inc)
 
-    # Grab baseline from first available emissions df (same across scenarios)
-    first_em: pd.DataFrame = next(
-        (v["emissions"] for v in scenario_results.values() if not v["emissions"].empty),
-        pd.DataFrame(),
-    )
+    em_base = _first_em(scenario_results)
+    em_inc = _first_em(scenario_results_inc) if scenario_results_inc else pd.DataFrame()
 
     st.divider()
 
     # ── KPI row ────────────────────────────────────────────────────────────────
     n_buildings = len(policy_impacts)
     mean_prop = float(propensity_result.mean_acceptance_probability)
+    kpi_cols = st.columns(3 if incentives_enabled else 2)
+    kpi_cols[0].metric("Buildings modelled", f"{n_buildings:,}")
+    kpi_cols[1].metric("Mean acceptance prob. (no incentive)", f"{mean_prop:.1%}")
+    if incentives_enabled and propensity_result_inc:
+        mean_prop_inc = float(propensity_result_inc.mean_acceptance_probability)
+        kpi_cols[2].metric("Mean acceptance prob. (with incentive)", f"{mean_prop_inc:.1%}",
+                           delta=f"{mean_prop_inc - mean_prop:+.1%}")
 
-    k1, k2 = st.columns(2)
-    k1.metric("Buildings modelled", f"{n_buildings:,}")
-    k2.metric("Mean acceptance probability", f"{mean_prop:.1%}")
-
-    # Per-scenario summary table
+    # ── Summary table (base only) ──────────────────────────────────────────────
     summary_rows = []
     for name, res in scenario_results.items():
         ys = res["uptake"].yearly_summary
@@ -1044,139 +1392,131 @@ def _render_result_charts() -> None:
             "Emissions reduction vs baseline": f"{savings:.1f}%" if not pd.isna(savings) else "—",
         })
     if summary_rows:
-        st.dataframe(
-            pd.DataFrame(summary_rows).set_index("Adoption scenario"),
-            use_container_width=True,
-        )
+        st.dataframe(pd.DataFrame(summary_rows).set_index("Adoption scenario"),
+                     use_container_width=True)
 
     st.divider()
 
-    # ── Adoption trajectories — all scenarios with bands ──────────────────────
+    # ── Adoption trajectories ─────────────────────────────────────────────────
     st.markdown(f"### Adoption Trajectories — {retrofit_name}")
-    fig_adopt = go.Figure()
-    for i, (name, res) in enumerate(scenario_results.items()):
-        ys = res["uptake"].yearly_summary.sort_values("year")
-        if ys.empty:
-            continue
-        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
-        years = ys["year"].tolist()
-        mean_s = ys["cumulative_adoption_pct"]
-        p10_s = ys["cumulative_adoption_pct_p10"] if "cumulative_adoption_pct_p10" in ys.columns else None
-        p90_s = ys["cumulative_adoption_pct_p90"] if "cumulative_adoption_pct_p90" in ys.columns else None
-        _add_scenario_traces(fig_adopt, years, mean_s, p10_s, p90_s, name, line_color, band_rgba)
-    for yr in simulated_years:
-        fig_adopt.add_vline(
-            x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
-            annotation_text=str(yr), annotation_position="top",
-            annotation_font_size=11, annotation_font_color="#64748b",
-        )
-    fig_adopt.update_layout(
-        yaxis=dict(title="Cumulative adoption (%)", range=[0, 105]),
-        xaxis_title="Year",
-        height=380, margin=dict(t=20, b=20),
-        legend=dict(orientation="h", y=-0.2),
-    )
-    st.plotly_chart(fig_adopt, use_container_width=True)
+    if incentives_enabled and scenario_results_inc:
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.caption("No incentive")
+            st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
+                            use_container_width=True)
+        with col_r:
+            st.caption("With incentive")
+            st.plotly_chart(_build_adoption_fig(scenario_results_inc, simulated_years),
+                            use_container_width=True)
+    else:
+        st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
+                        use_container_width=True)
 
-    # ── Emissions trajectories — baseline + scenarios with ±10% bands ──────────
+    # ── Energy usage trajectories (full width — same baseline for both) ────────
     st.divider()
-    st.markdown("### Emissions Trajectories (metric tonnes CO₂/yr)")
-    st.caption("Shaded band = ±10% uncertainty around the mean scenario trajectory.")
-    fig_em = go.Figure()
-
-    # Baseline: all buildings on baseline energy forever (zero adoption)
-    if not first_em.empty:
-        fig_em.add_trace(go.Scatter(
-            x=first_em["year"].tolist(),
-            y=first_em["baseline_emissions_t"].tolist(),
-            mode="lines",
-            name="Baseline (0% adoption)",
+    st.markdown("### Energy Usage Trajectories (GWh/yr)")
+    st.caption(
+        "Total building-stock energy each year: adopted buildings contribute retrofit-scenario kWh, "
+        "all others contribute baseline kWh. As adoption grows the total decreases toward the full-retrofit level."
+    )
+    fig_energy = go.Figure()
+    if not em_base.empty and "baseline_kwh_GWh" in em_base.columns:
+        fig_energy.add_trace(go.Scatter(
+            x=em_base["year"].tolist(), y=em_base["baseline_kwh_GWh"].tolist(),
+            mode="lines", name="Baseline (0% adoption)",
             line=dict(color="#dc2626", width=2.5, dash="dot"),
         ))
-
     for i, (name, res) in enumerate(scenario_results.items()):
         em = res["emissions"]
-        if em.empty:
+        if em.empty or "scenario_kwh_mean_GWh" not in em.columns:
             continue
         line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
-        yrs = em["year"].tolist()
-        mean_vals = em["scenario_mean_t"].tolist()
-        lo_vals = [v * 0.90 for v in mean_vals]
-        hi_vals = [v * 1.10 for v in mean_vals]
-
-        # Lower bound — invisible anchor
-        fig_em.add_trace(go.Scatter(
-            x=yrs, y=lo_vals,
-            mode="lines", line=dict(color="rgba(0,0,0,0)"),
-            showlegend=False, hoverinfo="skip",
-            legendgroup=name,
-        ))
-        # Upper bound — fills down to lower bound
-        fig_em.add_trace(go.Scatter(
-            x=yrs, y=hi_vals,
-            mode="lines", line=dict(color="rgba(0,0,0,0)"),
-            fill="tonexty", fillcolor=band_rgba,
-            showlegend=False, hoverinfo="skip",
-            legendgroup=name,
-        ))
-        # Mean line
-        fig_em.add_trace(go.Scatter(
-            x=yrs, y=mean_vals,
-            mode="lines", name=name,
-            line=dict(color=line_color, width=2.5),
-            legendgroup=name,
-        ))
-
-    for yr in simulated_years:
-        fig_em.add_vline(
-            x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
-            annotation_text=str(yr), annotation_position="top",
-            annotation_font_size=11, annotation_font_color="#64748b",
+        mean_kwh = em["scenario_kwh_mean_GWh"]
+        p10_kwh = em["scenario_kwh_p10_GWh"] if "scenario_kwh_p10_GWh" in em.columns else None
+        p90_kwh = em["scenario_kwh_p90_GWh"] if "scenario_kwh_p90_GWh" in em.columns else None
+        _add_scenario_traces(
+            fig_energy, em["year"].tolist(), mean_kwh,
+            pd.Series(p10_kwh.values, index=mean_kwh.index) if p10_kwh is not None else None,
+            pd.Series(p90_kwh.values, index=mean_kwh.index) if p90_kwh is not None else None,
+            name, line_color, band_rgba,
         )
-    fig_em.update_layout(
-        yaxis_title="tCO₂/yr", xaxis_title="Year",
-        height=400, margin=dict(t=20, b=20),
-        legend=dict(orientation="h", y=-0.2),
-    )
-    st.plotly_chart(fig_em, use_container_width=True)
+    for yr in simulated_years:
+        fig_energy.add_vline(x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
+                             annotation_text=str(yr), annotation_position="top",
+                             annotation_font_size=11, annotation_font_color="#64748b")
+    fig_energy.update_layout(yaxis_title="GWh/yr", xaxis_title="Year",
+                              height=400, margin=dict(t=20, b=20),
+                              legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(fig_energy, use_container_width=True)
 
-    # ── Propensity distribution + energy savings scatter ──────────────────────
+    # ── Emissions trajectories ─────────────────────────────────────────────────
     st.divider()
-    col_p, col_e = st.columns(2)
+    st.markdown("### Emissions Trajectories (metric tonnes CO₂/yr)")
+    st.caption(
+        "kWh from the energy chart × per-fuel emissions factors (which decline with grid decarbonisation). "
+        "Shaded band = MC P10–P90."
+    )
+    if incentives_enabled and scenario_results_inc:
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.caption("No incentive")
+            st.plotly_chart(_build_emissions_fig(scenario_results, em_base, simulated_years),
+                            use_container_width=True)
+        with col_r:
+            st.caption("With incentive")
+            st.plotly_chart(_build_emissions_fig(scenario_results_inc, em_inc, simulated_years),
+                            use_container_width=True)
+    else:
+        st.plotly_chart(_build_emissions_fig(scenario_results, em_base, simulated_years),
+                        use_container_width=True)
 
-    with col_p:
-        st.markdown("### Propensity Distribution")
-        probs = propensity_result.data["acceptance_probability"].dropna()
-        if not probs.empty:
-            fig_hist = go.Figure(go.Histogram(x=probs, nbinsx=40, marker_color="#2563eb", opacity=0.75))
-            fig_hist.update_layout(
-                xaxis_title="Acceptance probability", yaxis_title="Count",
-                height=300, margin=dict(t=10, b=10),
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
+    # ── Propensity distribution ───────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Propensity Distribution")
 
-    with col_e:
-        st.markdown("### Energy Savings vs. Propensity")
-        if "acceptance_probability" not in policy_impacts.columns:
-            plot_df = policy_impacts.join(
-                propensity_result.data.set_index("building.id")[["acceptance_probability"]],
-                on="building.id", how="left",
+    def _propensity_hist(result, color: str, label: str) -> go.Figure:
+        probs = result.data["acceptance_probability"].dropna()
+        fig = go.Figure(go.Histogram(x=probs, nbinsx=40, marker_color=color, opacity=0.75, name=label))
+        fig.update_layout(xaxis_title="Acceptance probability", yaxis_title="Count",
+                          height=280, margin=dict(t=10, b=10))
+        return fig
+
+    if incentives_enabled and propensity_result_inc:
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.caption("No incentive")
+            st.plotly_chart(_propensity_hist(propensity_result, "#2563eb", "No incentive"),
+                            use_container_width=True)
+        with col_r:
+            st.caption("With incentive")
+            st.plotly_chart(_propensity_hist(propensity_result_inc, "#16a34a", "With incentive"),
+                            use_container_width=True)
+    else:
+        col_p, col_e = st.columns(2)
+        with col_p:
+            st.plotly_chart(_propensity_hist(propensity_result, "#2563eb", "Propensity"),
+                            use_container_width=True)
+        with col_e:
+            st.markdown("### Energy Savings vs. Propensity")
+            plot_df = policy_impacts if "acceptance_probability" in policy_impacts.columns else (
+                policy_impacts.join(
+                    propensity_result.data.set_index("building.id")[["acceptance_probability"]],
+                    on="building.id", how="left",
+                )
             )
-        else:
-            plot_df = policy_impacts
-        if "acceptance_probability" in plot_df.columns and "energy_cost.annual_savings" in plot_df.columns:
-            fig_scatter = go.Figure(go.Scatter(
-                x=plot_df["energy_cost.annual_savings"],
-                y=plot_df["acceptance_probability"],
-                mode="markers",
-                marker=dict(color="#9333ea", size=4, opacity=0.5),
-            ))
-            fig_scatter.update_layout(
-                xaxis_title="Annual energy savings ($/yr)",
-                yaxis_title="Acceptance probability",
-                height=300, margin=dict(t=10, b=10),
-            )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            if "acceptance_probability" in plot_df.columns and "energy_cost.annual_savings" in plot_df.columns:
+                fig_scatter = go.Figure(go.Scatter(
+                    x=plot_df["energy_cost.annual_savings"],
+                    y=plot_df["acceptance_probability"],
+                    mode="markers", marker=dict(color="#9333ea", size=4, opacity=0.5),
+                ))
+                fig_scatter.update_layout(
+                    xaxis_title="Annual energy savings ($/yr)",
+                    yaxis_title="Acceptance probability",
+                    height=280, margin=dict(t=10, b=10),
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
 
     # ── Download ───────────────────────────────────────────────────────────────
     st.divider()
@@ -1974,7 +2314,7 @@ def _render_wip_explorer_tab() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
-    st.title("🏗️ Willingness-to-Pay & Adoption Analysis")
+    st.title("Willingness-to-Pay & Adoption Analysis")
     st.markdown(
         "Analyse building retrofit adoption and emissions trajectories using "
         "energy simulation output from [globi](https://github.com/globi)."

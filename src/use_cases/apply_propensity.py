@@ -41,13 +41,13 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
 import yaml
+from pydantic import BaseModel, ConfigDict
 
 logger = logging.getLogger(__name__)
 
@@ -110,9 +110,10 @@ def _merge_cohort_income_levels(propensity_cfg: dict) -> dict[str, float]:
     return out
 
 
-@dataclass
-class PropensityResult:
+class PropensityResult(BaseModel):
     """Container for propensity calculation results."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     data: pd.DataFrame
     n_buildings: int
@@ -164,6 +165,7 @@ class PropensityModelEngine:
         neighbor_effect: float | None = None,
         random_seed: int | None = None,
         n_monte_carlo_samples: int | None = None,
+        incentive_by_income: dict[float, float] | None = None,
         # Commercial model parameters
         npv_years: int | None = None,
         wacc: float | None = None,
@@ -226,6 +228,7 @@ class PropensityModelEngine:
         self.random_seed = random_seed if random_seed is not None else prop_cfg.get("random_seed", 42)
         self.rng = np.random.default_rng(self.random_seed)
         self.n_monte_carlo_samples = n_monte_carlo_samples if n_monte_carlo_samples is not None else prop_cfg.get("n_monte_carlo_samples", 100)
+        self.incentive_by_income: dict[float, float] | None = incentive_by_income
         self.compute_cohort_acceptance = bool(prop_cfg.get("compute_cohort_acceptance", True))
         self.cohort_income_levels_k_usd = _merge_cohort_income_levels(prop_cfg)
 
@@ -501,7 +504,15 @@ class PropensityModelEngine:
             cost = upfront_cost[idx]
             savings = energy_savings[idx]
 
-            probs: np.ndarray = np.asarray(self._logistic(age[:, None], edu, hh, inc, concern, cost[:, None], self.neighbor_effect, savings[:, None]))
+            if self.incentive_by_income is not None:
+                # Map each sampled income value → incentive USD, convert to k$ (cost units)
+                incentive_lookup = {v: self.incentive_by_income.get(v, 0.0) for v in INCOME_CATEGORIES}
+                incentive_matrix = np.vectorize(incentive_lookup.__getitem__)(inc) / 1000
+                cost_input = np.maximum(cost[:, None] - incentive_matrix, 0.0)
+            else:
+                cost_input = cost[:, None]
+
+            probs: np.ndarray = np.asarray(self._logistic(age[:, None], edu, hh, inc, concern, cost_input, self.neighbor_effect, savings[:, None]))
             propensity_min[idx] = probs.min(axis=1)
             propensity_max[idx] = probs.max(axis=1)
             propensity_mean[idx] = probs.mean(axis=1)

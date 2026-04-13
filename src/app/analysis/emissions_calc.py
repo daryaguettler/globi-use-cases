@@ -123,56 +123,90 @@ def compute_building_annual_emissions(
 
 # ── Main trajectory calculation ────────────────────────────────────────────────
 
+def interpolate_building_energy(
+    year_energy: dict[int, pd.DataFrame],
+    year: int,
+) -> pd.DataFrame:
+    """Return per-building kWh DataFrame interpolated (or clamped) to *year*.
+
+    year_energy maps anchor years to DataFrames indexed by building.id with
+    columns ``baseline_kwh_<Fuel>`` and ``scenario_kwh_<Fuel>``.
+    Years outside the anchor range hold the nearest anchor value constant.
+    """
+    anchors = sorted(year_energy.keys())
+    if year <= anchors[0]:
+        return year_energy[anchors[0]]
+    if year >= anchors[-1]:
+        return year_energy[anchors[-1]]
+    for i in range(len(anchors) - 1):
+        y0, y1 = anchors[i], anchors[i + 1]
+        if y0 <= year <= y1:
+            t = (year - y0) / (y1 - y0)
+            df0, df1 = year_energy[y0], year_energy[y1]
+            # Align df1 to df0's index so we interpolate each building against
+            # itself, not an arbitrary peer from a differently-ordered parquet.
+            df1_aligned = df1.reindex(df0.index).fillna(df0)
+            result = df0.copy()
+            for col in df0.columns:
+                if col in df1_aligned.columns:
+                    result[col] = df0[col].values * (1 - t) + df1_aligned[col].values * t
+            return result
+    return year_energy[anchors[-1]]
+
+
 def compute_emissions_trajectory(
     policy_impacts: pd.DataFrame,
     yearly_summary: pd.DataFrame,
     emissions_factors_json: dict,
     years: list[int],
+    year_energy: dict[int, pd.DataFrame] | None = None,
 ) -> pd.DataFrame:
-    """Compute total stock emissions trajectory under the MC-ensemble adoption.
+    """Compute total stock emissions and energy trajectory under MC-ensemble adoption.
 
     Args:
-        policy_impacts:        Output of ``build_policy_impacts`` — per-building
-                               baseline and scenario kWh by fuel.  If an
-                               ``acceptance_probability`` column is present (joined
-                               from the propensity model), buildings are ranked by
-                               propensity so that the P10/P90 adoption bounds reflect
-                               which specific buildings adopt, not just how many.
-        yearly_summary:        ``UptakeResult.yearly_summary`` from AdoptionEngine,
-                               with columns ``year``, ``cumulative_adoption_pct``,
-                               and optionally ``cumulative_adoption_pct_p10`` /
-                               ``cumulative_adoption_pct_p90``.
-        emissions_factors_json: Dict with key ``"fuels"`` mapping to per-fuel
-                                trajectory dicts (from emissions_trajectories.json).
-        years:                 Projection years.
+        policy_impacts:         Output of ``build_policy_impacts`` for the reference
+                                year.  Used for propensity ranking and (if year_energy
+                                is None) for static per-building kWh.
+        yearly_summary:         ``UptakeResult.yearly_summary`` from AdoptionEngine.
+        emissions_factors_json: Dict with key ``"fuels"`` mapping per-fuel trajectories.
+        years:                  Projection years.
+        year_energy:            Optional dict mapping anchor years → DataFrames indexed
+                                by building.id with ``baseline_kwh_<Fuel>`` /
+                                ``scenario_kwh_<Fuel>`` columns.  When provided, energy
+                                is linearly interpolated between anchor years so each
+                                projection year uses year-appropriate kWh values.
 
     Returns:
         DataFrame with columns:
-            year, baseline_emissions_t, scenario_mean_t,
-            scenario_p10_t, scenario_p90_t, emissions_savings_mean_t
-        (all in metric tonnes CO2)
+            year, baseline_emissions_t, scenario_mean_t, scenario_p10_t,
+            scenario_p90_t, emissions_savings_mean_t,
+            baseline_kwh_GWh, scenario_kwh_mean_GWh,
+            scenario_kwh_p10_GWh, scenario_kwh_p90_GWh
     """
     fuels_data = emissions_factors_json.get("fuels", emissions_factors_json)
     ef_df = interpolate_emissions_factors(fuels_data, years)
 
-    # Per-building annual kWh DataFrames
-    base_fuel_kwh = _extract_fuel_kwh(policy_impacts, prefix="baseline")
-    scen_fuel_kwh = _extract_fuel_kwh(policy_impacts, prefix="scenario")
+    # Static per-building kWh (used only when year_energy is None)
+    base_fuel_kwh_static = None
+    scen_fuel_kwh_static = None
+    if year_energy is None:
+        base_fuel_kwh_static = _extract_fuel_kwh(policy_impacts, prefix="baseline")
+        scen_fuel_kwh_static = _extract_fuel_kwh(policy_impacts, prefix="scenario")
 
     n_buildings = len(policy_impacts)
+    bid_values = (
+        policy_impacts["building.id"].values
+        if "building.id" in policy_impacts.columns
+        else None
+    )
 
-    # If propensity scores are available, rank buildings by adoption likelihood so
-    # P10/P90 adoption fractions select different building combinations — not just
-    # different counts.  This means the emission bounds reflect which buildings
-    # actually adopted across the MC runs, not only portfolio-average savings.
     if "acceptance_probability" in policy_impacts.columns:
         propensity_order = (
             policy_impacts["acceptance_probability"]
             .rank(method="first", ascending=False)
             .astype(int)
-            .sub(1)          # 0-based rank: 0 = highest propensity
+            .sub(1)
         )
-        # Integer index positions sorted by propensity (highest first)
         ranked_idx = propensity_order.argsort().values
         use_ranked = True
     else:
@@ -183,13 +217,28 @@ def compute_emissions_trajectory(
     for year in years:
         ef_row = ef_df.loc[year] if year in ef_df.index else ef_df.iloc[-1]
 
-        # Per-building annual emissions (kg), aligned to policy_impacts row order
+        if year_energy is not None:
+            e_df = interpolate_building_energy(year_energy, year)
+            if bid_values is not None:
+                e_df = e_df.reindex(bid_values).fillna(0.0)
+            base_fuel_kwh = e_df[
+                [c for c in e_df.columns if c.startswith("baseline_kwh_")]
+            ].rename(columns=lambda c: c.replace("baseline_kwh_", "kwh_"))
+            scen_fuel_kwh = e_df[
+                [c for c in e_df.columns if c.startswith("scenario_kwh_")]
+            ].rename(columns=lambda c: c.replace("scenario_kwh_", "kwh_"))
+        else:
+            base_fuel_kwh = base_fuel_kwh_static
+            scen_fuel_kwh = scen_fuel_kwh_static
+
         base_em = compute_building_annual_emissions(base_fuel_kwh, ef_row).values
         scen_em = compute_building_annual_emissions(scen_fuel_kwh, ef_row).values
+        base_kwh_per_bldg = base_fuel_kwh.sum(axis=1).values
+        scen_kwh_per_bldg = scen_fuel_kwh.sum(axis=1).values
 
         total_baseline_kg = float(base_em.sum())
+        total_baseline_kwh = float(base_kwh_per_bldg.sum())
 
-        # Adoption fractions from MC ensemble
         year_rows = yearly_summary[yearly_summary["year"] == year]
         if year_rows.empty:
             mean_pct = p10_pct = p90_pct = 0.0
@@ -199,28 +248,30 @@ def compute_emissions_trajectory(
             p10_pct = float(r.get("cumulative_adoption_pct_p10", mean_pct))
             p90_pct = float(r.get("cumulative_adoption_pct_p90", mean_pct))
 
-        def _stock_emissions(adopted_frac: float) -> float:
-            n_adopt = round(adopted_frac / 100.0 * n_buildings)
-            n_adopt = max(0, min(n_adopt, n_buildings))
+        def _stock_metric(
+            adopted_frac: float,
+            adopted_vals: np.ndarray,
+            baseline_vals: np.ndarray,
+        ) -> float:
+            n_adopt = max(0, min(round(adopted_frac / 100.0 * n_buildings), n_buildings))
             if use_ranked:
-                # Top-n_adopt buildings by propensity get scenario emissions;
-                # the rest stay on baseline.  This captures the MC uncertainty
-                # about which specific buildings adopt.
                 adopted_pos = ranked_idx[:n_adopt]
                 rest_pos = ranked_idx[n_adopt:]
-                return float(scen_em[adopted_pos].sum() + base_em[rest_pos].sum())
-            else:
-                # Fallback: portfolio-average approximation
-                avg_base = float(base_em.mean()) if n_buildings > 0 else 0.0
-                avg_scen = float(scen_em.mean()) if n_buildings > 0 else 0.0
-                return n_adopt * avg_scen + (n_buildings - n_adopt) * avg_base
+                return float(adopted_vals[adopted_pos].sum() + baseline_vals[rest_pos].sum())
+            avg_base = float(baseline_vals.mean()) if n_buildings > 0 else 0.0
+            avg_adopted = float(adopted_vals.mean()) if n_buildings > 0 else 0.0
+            return n_adopt * avg_adopted + (n_buildings - n_adopt) * avg_base
 
         rows.append({
             "year": year,
             "baseline_emissions_t": total_baseline_kg / 1000.0,
-            "scenario_mean_t": _stock_emissions(mean_pct) / 1000.0,
-            "scenario_p10_t": _stock_emissions(p10_pct) / 1000.0,
-            "scenario_p90_t": _stock_emissions(p90_pct) / 1000.0,
+            "scenario_mean_t": _stock_metric(mean_pct, scen_em, base_em) / 1000.0,
+            "scenario_p10_t": _stock_metric(p10_pct, scen_em, base_em) / 1000.0,
+            "scenario_p90_t": _stock_metric(p90_pct, scen_em, base_em) / 1000.0,
+            "baseline_kwh_GWh": total_baseline_kwh / 1e6,
+            "scenario_kwh_mean_GWh": _stock_metric(mean_pct, scen_kwh_per_bldg, base_kwh_per_bldg) / 1e6,
+            "scenario_kwh_p10_GWh": _stock_metric(p10_pct, scen_kwh_per_bldg, base_kwh_per_bldg) / 1e6,
+            "scenario_kwh_p90_GWh": _stock_metric(p90_pct, scen_kwh_per_bldg, base_kwh_per_bldg) / 1e6,
             "adoption_pct_mean": mean_pct,
             "adoption_pct_p10": p10_pct,
             "adoption_pct_p90": p90_pct,

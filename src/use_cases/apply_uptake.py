@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from pydantic import BaseModel, ConfigDict
 from pathlib import Path
 from typing import Any
 
@@ -78,9 +78,8 @@ MethodName = (
 )
 
 
-@dataclass
-class AdoptionScenario:
-    """Container for a named adoption rate scenario."""
+class AdoptionScenario(BaseModel):
+    """Named adoption rate scenario loaded from JSON config."""
 
     name: str
     description: str
@@ -110,9 +109,10 @@ class AdoptionScenario:
         return self.max_adoption
 
 
-@dataclass
-class UptakeResult:
+class UptakeResult(BaseModel):
     """Container for uptake calculation results."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     data: pd.DataFrame
     yearly_summary: pd.DataFrame

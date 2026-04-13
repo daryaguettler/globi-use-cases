@@ -17,8 +17,18 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+class CensusGeocodeResult(BaseModel):
+    """Result from the Census Geocoder API for a single lat/lon point."""
+
+    state: str = Field(description="State FIPS code")
+    county: str = Field(description="County FIPS code")
+    tract: str = Field(description="Tract FIPS code")
+    geoid: str = Field(description="Full 11-digit GEOID (state+county+tract)")
 
 # Census API base URLs
 _GEOCODER_URL = (
@@ -37,11 +47,8 @@ EDUCATION_CATEGORIES: list[float] = [1.0, 2.0, 3.0, 4.0]
 
 # ── Census Geocoder ────────────────────────────────────────────────────────────
 
-def geocode_point(lat: float, lon: float, retries: int = 3) -> dict[str, str] | None:
-    """Return ``{state, county, tract}`` FIPS codes for a lat/lon point.
-
-    Returns ``None`` on failure.  Rate-limited to avoid hitting API limits.
-    """
+def geocode_point(lat: float, lon: float, retries: int = 3) -> CensusGeocodeResult | None:
+    """Return FIPS codes for a lat/lon point, or ``None`` on failure."""
     params = {
         "x": lon,
         "y": lat,
@@ -62,12 +69,12 @@ def geocode_point(lat: float, lon: float, retries: int = 3) -> dict[str, str] | 
             )
             if geos:
                 g = geos[0]
-                return {
-                    "state": g.get("STATE", ""),
-                    "county": g.get("COUNTY", ""),
-                    "tract": g.get("TRACT", ""),
-                    "geoid": g.get("GEOID", ""),
-                }
+                return CensusGeocodeResult(
+                    state=g.get("STATE", ""),
+                    county=g.get("COUNTY", ""),
+                    tract=g.get("TRACT", ""),
+                    geoid=g.get("GEOID", ""),
+                )
         except Exception as exc:
             logger.debug(f"Geocoder attempt {attempt + 1} failed: {exc}")
             if attempt < retries - 1:

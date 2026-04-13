@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import ClassVar
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +42,49 @@ PROPANE_DHW_SYSTEMS = {"PropaneDHW"}
 # End-use columns present in the parquet (energy intensity kWh/m²)
 _END_USES = ["Lighting", "Equipment", "Cooling", "Heating", "Domestic Hot Water"]
 
-# Default energy prices (USD/kWh equivalent)
-DEFAULT_ENERGY_PRICES: dict[str, float] = {
-    "Electricity": 0.17,
-    "Natural Gas": 0.043,   # $/kWh eq (~$1.26/therm)
-    "Fuel Oil": 0.038,      # $/kWh eq (~$4.00/gallon)
-    "Propane": 0.052,       # $/kWh eq (~$3.80/gallon)
-}
+
+class EnergyPrices(BaseModel):
+    """Per-fuel energy prices (USD/kWh equivalent)."""
+
+    electricity: float = Field(0.17, ge=0.0, description="$/kWh")
+    natural_gas: float = Field(0.043, ge=0.0, description="$/kWh eq (~$1.26/therm)")
+    fuel_oil: float = Field(0.038, ge=0.0, description="$/kWh eq (~$4.00/gallon)")
+    propane: float = Field(0.052, ge=0.0, description="$/kWh eq (~$3.80/gallon)")
+
+    _LABEL_TO_FIELD: ClassVar[dict[str, str]] = {
+        "Electricity": "electricity",
+        "Natural Gas": "natural_gas",
+        "Fuel Oil": "fuel_oil",
+        "Propane": "propane",
+    }
+
+    def get(self, fuel: str, default: float = 0.0) -> float:
+        field = self._LABEL_TO_FIELD.get(fuel)
+        return getattr(self, field, default) if field else default
+
+    def to_dict(self) -> dict[str, float]:
+        return {label: getattr(self, field) for label, field in self._LABEL_TO_FIELD.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, float]) -> "EnergyPrices":
+        return cls(
+            electricity=d.get("Electricity", 0.17),
+            natural_gas=d.get("Natural Gas", 0.043),
+            fuel_oil=d.get("Fuel Oil", 0.038),
+            propane=d.get("Propane", 0.052),
+        )
+
+
+class PolicyImpactsConfig(BaseModel):
+    """Configuration for building policy impacts computation."""
+
+    scenario_name: str
+    cost_per_sqm: float = Field(150.0, ge=0.0, description="Gross retrofit cost per m² conditioned area")
+    energy_prices: EnergyPrices = Field(default_factory=EnergyPrices)
+
+
+# Kept as a plain dict for backward-compat import sites; use EnergyPrices() for new code
+DEFAULT_ENERGY_PRICES: dict[str, float] = EnergyPrices().to_dict()
 
 FUEL_LABELS = tuple(DEFAULT_ENERGY_PRICES.keys())
 
@@ -190,14 +228,15 @@ def compute_fuel_kwh(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_annual_energy_cost(
     fuel_kwh: pd.DataFrame,
-    prices: dict[str, float],
+    prices: EnergyPrices | dict[str, float],
 ) -> pd.Series:
     """Return total annual energy cost per building (USD)."""
+    p = prices if isinstance(prices, EnergyPrices) else EnergyPrices.from_dict(prices)
     total = pd.Series(np.zeros(len(fuel_kwh)), index=fuel_kwh.index)
     for fuel in FUEL_LABELS:
         col = f"kwh_{fuel}"
         if col in fuel_kwh.columns:
-            total += fuel_kwh[col] * prices.get(fuel, 0.0)
+            total += fuel_kwh[col] * p.get(fuel, 0.0)
     return total
 
 
@@ -235,7 +274,7 @@ def build_policy_impacts(
     scenario_df: pd.DataFrame,
     scenario_name: str,
     cost_per_sqm: float,
-    energy_prices: dict[str, float] | None = None,
+    energy_prices: EnergyPrices | dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Produce a ``policy_impacts`` DataFrame compatible with PropensityModelEngine.
 
@@ -244,12 +283,17 @@ def build_policy_impacts(
         scenario_df:   Flat DataFrame from ``load_energy_parquet`` for the scenario.
         scenario_name: User-provided label for the retrofit scenario.
         cost_per_sqm:  Gross retrofit cost per m² of conditioned floor area.
-        energy_prices: Optional per-fuel USD/kWh overrides.
+        energy_prices: Optional per-fuel USD/kWh overrides as ``EnergyPrices`` or dict.
 
     Returns:
         Flat DataFrame (one row per building) ready for PropensityModelEngine.
     """
-    prices = {**DEFAULT_ENERGY_PRICES, **(energy_prices or {})}
+    if isinstance(energy_prices, EnergyPrices):
+        prices = energy_prices
+    elif isinstance(energy_prices, dict):
+        prices = EnergyPrices.from_dict({**DEFAULT_ENERGY_PRICES, **energy_prices})
+    else:
+        prices = EnergyPrices()
 
     base_aligned, scen_aligned = _align_on_id(baseline_df, scenario_df)
     n = len(base_aligned)

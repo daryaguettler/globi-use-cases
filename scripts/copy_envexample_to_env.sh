@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
+# seed .env from .env.example if missing
 set -euo pipefail
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
-if [[ -f "$root/.env" ]]; then
+env="$root/.env"
+example="$root/.env.example"
+
+if [[ -f "$env" ]]; then
   exit 0
 fi
-if [[ -f "$root/.env.example" ]]; then
-  cp "$root/.env.example" "$root/.env"
+if [[ -f "$example" ]]; then
+  cp "$example" "$env"
   echo "copied .env.example to .env"
-  exit 0
+else
+  touch "$env"
+  echo "created empty .env (add .env.example to seed defaults)"
 fi
-touch "$root/.env"
-echo "created empty .env (add .env.example to seed defaults)"
