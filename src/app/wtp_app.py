@@ -123,8 +123,8 @@ for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-_EXAMPLE_BASELINE = _DATA_DIR / "globi_outputs" / "split" / "Baseline_EnergyAndPeak.pq"
-_EXAMPLE_SCENARIO = _DATA_DIR / "globi_outputs" / "split" / "ASHP_EnergyAndPeak.pq"
+_EXAMPLE_BASELINE = _DATA_DIR / "example" / "Baseline" / "EnergyAndPeak.pq"
+_EXAMPLE_SCENARIO = _DATA_DIR / "example" / "Retrofit" / "EnergyAndPeak.pq"
 _EXAMPLE_YEAR = 2025
 
 if (
@@ -140,7 +140,7 @@ if (
     }
     st.session_state["selected_years"] = [_EXAMPLE_YEAR]
     st.session_state["n_years"] = 1
-    st.session_state["scenario_name"] = "ASHP"
+    st.session_state["scenario_name"] = "Retrofit"
     st.session_state["_example_preloaded"] = True
 
 @st.cache_data(show_spinner=False)
@@ -204,8 +204,8 @@ def _render_upload_tab() -> None:
 
     if st.session_state.get("_example_preloaded"):
         st.info(
-            "**Example data pre-loaded** — `Baseline_EnergyAndPeak.pq` and "
-            "`ASHP_EnergyAndPeak.pq` from `data/inputs/globi_outputs/split/` are "
+            "**Example data pre-loaded** — `EnergyAndPeak.pq` from "
+            "`data/inputs/example/Baseline/` and `data/inputs/example/Retrofit/` are "
             "ready to use. Jump straight to **5 · Run & Results** to see the full "
             "pipeline, or upload your own files below to replace them."
         )
@@ -1404,14 +1404,14 @@ def _render_result_charts() -> None:
         with col_l:
             st.caption("No incentive")
             st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
-                            use_container_width=True)
+                            use_container_width=True, key="adoption_base")
         with col_r:
             st.caption("With incentive")
             st.plotly_chart(_build_adoption_fig(scenario_results_inc, simulated_years),
-                            use_container_width=True)
+                            use_container_width=True, key="adoption_inc")
     else:
         st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
-                        use_container_width=True)
+                        use_container_width=True, key="adoption_base")
 
     # ── Energy usage trajectories (full width — same baseline for both) ────────
     st.divider()
@@ -1448,7 +1448,7 @@ def _render_result_charts() -> None:
     fig_energy.update_layout(yaxis_title="GWh/yr", xaxis_title="Year",
                               height=400, margin=dict(t=20, b=20),
                               legend=dict(orientation="h", y=-0.2))
-    st.plotly_chart(fig_energy, use_container_width=True)
+    st.plotly_chart(fig_energy, use_container_width=True, key="energy_usage")
 
     # ── Emissions trajectories ─────────────────────────────────────────────────
     st.divider()
@@ -1462,14 +1462,14 @@ def _render_result_charts() -> None:
         with col_l:
             st.caption("No incentive")
             st.plotly_chart(_build_emissions_fig(scenario_results, em_base, simulated_years),
-                            use_container_width=True)
+                            use_container_width=True, key="emissions_base")
         with col_r:
             st.caption("With incentive")
             st.plotly_chart(_build_emissions_fig(scenario_results_inc, em_inc, simulated_years),
-                            use_container_width=True)
+                            use_container_width=True, key="emissions_inc")
     else:
         st.plotly_chart(_build_emissions_fig(scenario_results, em_base, simulated_years),
-                        use_container_width=True)
+                        use_container_width=True, key="emissions_base")
 
     # ── Propensity distribution ───────────────────────────────────────────────
     st.divider()
@@ -1487,16 +1487,16 @@ def _render_result_charts() -> None:
         with col_l:
             st.caption("No incentive")
             st.plotly_chart(_propensity_hist(propensity_result, "#2563eb", "No incentive"),
-                            use_container_width=True)
+                            use_container_width=True, key="propensity_base")
         with col_r:
             st.caption("With incentive")
             st.plotly_chart(_propensity_hist(propensity_result_inc, "#16a34a", "With incentive"),
-                            use_container_width=True)
+                            use_container_width=True, key="propensity_inc")
     else:
         col_p, col_e = st.columns(2)
         with col_p:
             st.plotly_chart(_propensity_hist(propensity_result, "#2563eb", "Propensity"),
-                            use_container_width=True)
+                            use_container_width=True, key="propensity_base")
         with col_e:
             st.markdown("### Energy Savings vs. Propensity")
             plot_df = policy_impacts if "acceptance_probability" in policy_impacts.columns else (
@@ -1516,7 +1516,7 @@ def _render_result_charts() -> None:
                     yaxis_title="Acceptance probability",
                     height=280, margin=dict(t=10, b=10),
                 )
-                st.plotly_chart(fig_scatter, use_container_width=True)
+                st.plotly_chart(fig_scatter, use_container_width=True, key="scatter_savings")
 
     # ── Download ───────────────────────────────────────────────────────────────
     st.divider()

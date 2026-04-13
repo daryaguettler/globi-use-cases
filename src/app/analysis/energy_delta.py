@@ -42,6 +42,15 @@ PROPANE_DHW_SYSTEMS = {"PropaneDHW"}
 # End-use columns present in the parquet (energy intensity kWh/m²)
 _END_USES = ["Lighting", "Equipment", "Cooling", "Heating", "Domestic Hot Water"]
 
+# ── New-schema utility fuel mapping ────────────────────────────────────────────
+# Maps the column name used in Energy.Utilities.* to the canonical FUEL_LABELS key.
+_UTILITY_FUEL_MAP: dict[str, str] = {
+    "Electricity": "Electricity",
+    "NaturalGas": "Natural Gas",
+    "FuelOil": "Fuel Oil",
+    "Propane": "Propane",
+}
+
 
 class EnergyPrices(BaseModel):
     """Per-fuel energy prices (USD/kWh equivalent)."""
@@ -154,18 +163,50 @@ def _get_building_id(df: pd.DataFrame) -> pd.Series:
 
 # ── Energy attribution ─────────────────────────────────────────────────────────
 
+def _has_utilities_schema(df: pd.DataFrame) -> bool:
+    """Detect the 4-level MultiIndex column schema (Energy.Utilities.{fuel}.{month})."""
+    return any(
+        any(c.startswith(f"Energy.Utilities.{f}.") for c in df.columns)
+        for f in _UTILITY_FUEL_MAP
+    )
+
+
 def compute_fuel_kwh(df: pd.DataFrame) -> pd.DataFrame:
     """Compute per-building annual kWh by fuel type.
 
-    Reads energy-intensity columns (kWh/m²) and multiplies by conditioned area.
-    Heating and DHW are attributed to fuel via ``feature.semantic.*`` columns.
+    Supports two parquet schemas:
+
+    **New schema** (4-level MultiIndex columns, e.g. ``Energy.Utilities.NaturalGas.1``):
+        Fuel breakdown is read directly from ``Energy.Utilities.*`` monthly columns.
+        No heating-system semantic field is needed.
+
+    **Legacy schema** (flattened 2-level columns, e.g. ``Energy.Heating``):
+        Total end-use energy is read and attributed to fuel via
+        ``feature.semantic.Heating`` / ``feature.semantic.DHW`` columns.
 
     Returns a DataFrame with columns:
         ``kwh_Electricity``, ``kwh_Natural Gas``, ``kwh_Fuel Oil``, ``kwh_Propane``
     """
     area = _get_area(df)
 
-    # Energy intensity columns (kWh/m²)
+    # ── New schema: Energy.Utilities.{fuel}.{month} ────────────────────────────
+    if _has_utilities_schema(df):
+        result: dict[str, np.ndarray] = {}
+        for raw_name, label in _UTILITY_FUEL_MAP.items():
+            month_cols = [c for c in df.columns if c.startswith(f"Energy.Utilities.{raw_name}.")]
+            if month_cols:
+                intensity = (
+                    df[month_cols]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .fillna(0.0)
+                    .sum(axis=1)
+                )
+            else:
+                intensity = pd.Series(np.zeros(len(df)), index=df.index)
+            result[f"kwh_{label}"] = (intensity * area).values
+        return pd.DataFrame(result, index=df.index)
+
+    # ── Legacy schema: Energy.{end_use} + feature.semantic.Heating/DHW ─────────
     def _intensity(end_use: str) -> pd.Series:
         s = _col(df, f"Energy.{end_use}", f"energy.{end_use.lower()}")
         if s is not None:
@@ -195,7 +236,6 @@ def compute_fuel_kwh(df: pd.DataFrame) -> pd.DataFrame:
         gas += heating_kwh.where(is_gas_heat, 0.0)
         oil += heating_kwh.where(is_oil_heat, 0.0)
         propane += heating_kwh.where(is_prop_heat, 0.0)
-        # Unknown system → electric fallback
         known = is_elec_heat | is_gas_heat | is_oil_heat | is_prop_heat
         elec += heating_kwh.where(~known, 0.0)
     else:
@@ -337,7 +377,12 @@ def build_policy_impacts(
 _METADATA_MAP: dict[str, str] = {
     "feature.semantic.Typology": "feature.semantic.Typology",
     "feature.semantic.Age_bracket": "feature.semantic.Age_bracket",
+    "feature.semantic.Income": "feature.semantic.Income",
     "feature.geometry.energy_model_conditioned_area": "area_m2",
+    # New-schema geometry: rotated rectangle WKT (EPSG:3857) used for geocoding
+    "rotated_rectangle": "rotated_rectangle",
+    "GLOBI_ROTATED_RECTANGLE": "rotated_rectangle",
+    # Legacy-schema location fields
     "feature.location.lat": "lat",
     "feature.location.lon": "lon",
     "feature.location.county": "building.county",
