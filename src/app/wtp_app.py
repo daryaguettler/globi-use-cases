@@ -56,6 +56,8 @@ from use_cases.apply_uptake import AdoptionEngine
 _DATA_DIR = _REPO_ROOT / "data" / "inputs"
 _ADOPTION_CURVES_PATH = _DATA_DIR / "adoption_curves.json"
 _EMISSIONS_PATH = _DATA_DIR / "emissions_trajectories.json"
+_CONFIGS_DIR = _REPO_ROOT / "data" / "outputs"
+_CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
 
 _YEARS_RANGE = list(range(2024, 2101))
 _PROJECTION_YEARS = list(range(2025, 2101))
@@ -166,6 +168,108 @@ def _save_emissions_json(data: dict) -> None:
     _EMISSIONS_PATH.write_text(json.dumps(data, indent=4))
     st.cache_data.clear()
 
+
+# ── Config management ──────────────────────────────────────────────────────────
+
+def _list_saved_configs() -> list[str]:
+    """Return sorted list of config names found in data/outputs/."""
+    return sorted(
+        p.name for p in _CONFIGS_DIR.iterdir()
+        if p.is_dir() and (p / "config.json").exists()
+    )
+
+
+def _save_config(name: str) -> None:
+    """Persist current session state config + JSON files to data/outputs/{name}/config.json."""
+    import datetime
+
+    incentive_cfg: IncentiveConfig = st.session_state.get("incentive_config", IncentiveConfig())
+    config = {
+        "name": name,
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "adoption_curves": _load_adoption_curves(),
+        "emissions_trajectories": _load_emissions_json(),
+        "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
+        "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
+        "incentive_config": incentive_cfg.model_dump(),
+    }
+    config_dir = _CONFIGS_DIR / name
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(json.dumps(config, indent=4))
+
+
+def _load_config(name: str) -> bool:
+    """Load a saved config into session state and restore JSON input files. Returns True on success."""
+    config_path = _CONFIGS_DIR / name / "config.json"
+    if not config_path.exists():
+        return False
+    config = json.loads(config_path.read_text())
+
+    # Restore adoption curves + emissions to disk (so cached loaders pick them up)
+    if "adoption_curves" in config:
+        _ADOPTION_CURVES_PATH.write_text(json.dumps(config["adoption_curves"], indent=4))
+    if "emissions_trajectories" in config:
+        _EMISSIONS_PATH.write_text(json.dumps(config["emissions_trajectories"], indent=4))
+    st.cache_data.clear()
+
+    # Restore session state for energy prices, retrofit cost, incentives
+    if "energy_prices" in config:
+        st.session_state["energy_prices"] = config["energy_prices"]
+    if "cost_per_sqm" in config:
+        st.session_state["cost_per_sqm"] = float(config["cost_per_sqm"])
+    if "incentives_enabled" in config:
+        st.session_state["incentives_enabled"] = bool(config["incentives_enabled"])
+    if "incentive_config" in config:
+        st.session_state["incentive_config"] = IncentiveConfig(**config["incentive_config"])
+
+    return True
+
+
+def _render_config_manager() -> None:
+    """Sidebar panel for saving and loading named configurations."""
+    st.sidebar.title("Configurations")
+    st.sidebar.caption(
+        "Save or load a named configuration — including adoption curves, emissions "
+        "trajectories, energy prices, and retrofit & incentive costs."
+    )
+
+    saved = _list_saved_configs()
+
+    # ── Load existing config ───────────────────────────────────────────────────
+    if saved:
+        st.sidebar.markdown("**Load saved config**")
+        selected = st.sidebar.selectbox(
+            "Select config", options=saved, key="cfg_mgr_select",
+            label_visibility="collapsed",
+        )
+        if st.sidebar.button("Load", key="cfg_mgr_load", use_container_width=True):
+            if _load_config(selected):
+                st.sidebar.success(f"Loaded '{selected}'")
+                st.rerun()
+            else:
+                st.sidebar.error("Could not load config.")
+    else:
+        st.sidebar.info("No saved configs yet.")
+
+    st.sidebar.divider()
+
+    # ── Save current config ────────────────────────────────────────────────────
+    st.sidebar.markdown("**Save current config**")
+    new_name = st.sidebar.text_input(
+        "Config name", placeholder="e.g. high_incentives_2030",
+        key="cfg_mgr_new_name", label_visibility="collapsed",
+    )
+    save_disabled = not new_name.strip()
+    if st.sidebar.button(
+        "Save", key="cfg_mgr_save",
+        disabled=save_disabled,
+        use_container_width=True,
+    ):
+        clean_name = new_name.strip().replace(" ", "_")
+        _save_config(clean_name)
+        st.sidebar.success(f"Saved as '{clean_name}'")
+        st.rerun()
 
 
 def _preview_parquet(file_bytes: bytes) -> dict:
@@ -2314,6 +2418,8 @@ def _render_wip_explorer_tab() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    _render_config_manager()
+
     st.title("Willingness-to-Pay & Adoption Analysis")
     st.markdown(
         "Analyse building retrofit adoption and emissions trajectories using "
