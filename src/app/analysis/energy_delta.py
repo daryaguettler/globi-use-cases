@@ -133,7 +133,54 @@ def load_energy_parquet(source: str | Path | bytes) -> pd.DataFrame:
 
     result = pd.concat([meta, data], axis=1)
     result = result.loc[:, ~result.columns.duplicated()]
+    _extract_lat_lon(result)
     return result
+
+
+def _extract_lat_lon(df: pd.DataFrame) -> None:
+    """Derive ``lat``/``lon`` columns from ``rotated_rectangle`` if not already present.
+
+    Handles both WKT strings (old format, EPSG:3857) and base64-encoded WKB
+    (P3 format, also EPSG:3857).  Modifies *df* in-place; silently no-ops if
+    neither ``rotated_rectangle`` nor a lat/lon column can be found.
+    """
+    if "lat" in df.columns and "lon" in df.columns:
+        return
+
+    rect_col = next(
+        (c for c in ["rotated_rectangle", "GLOBI_ROTATED_RECTANGLE"] if c in df.columns),
+        None,
+    )
+    if rect_col is None:
+        return
+
+    try:
+        import base64
+        import geopandas as gpd
+        from shapely import wkb as shapely_wkb
+        from shapely import wkt as shapely_wkt
+
+        def _parse_geom(s: str):
+            try:
+                return shapely_wkt.loads(s)
+            except Exception:
+                pass
+            try:
+                return shapely_wkb.loads(base64.b64decode(s))
+            except Exception:
+                return None
+
+        series = df[rect_col].dropna().astype(str)
+        geoms = series.map(_parse_geom)
+        valid = geoms.dropna()
+        if valid.empty:
+            return
+        gs = gpd.GeoSeries(valid, crs="EPSG:3857").to_crs("EPSG:4326")
+        centroids = gs.centroid
+        df.loc[valid.index, "lon"] = centroids.x.values
+        df.loc[valid.index, "lat"] = centroids.y.values
+    except Exception as exc:
+        logger.debug(f"lat/lon extraction from rotated_rectangle failed: {exc}")
 
 
 # ── Feature extraction ─────────────────────────────────────────────────────────
@@ -382,9 +429,11 @@ _METADATA_MAP: dict[str, str] = {
     # New-schema geometry: rotated rectangle WKT (EPSG:3857) used for geocoding
     "rotated_rectangle": "rotated_rectangle",
     "GLOBI_ROTATED_RECTANGLE": "rotated_rectangle",
-    # Legacy-schema location fields
+    # Legacy-schema location fields and derived centroid columns
     "feature.location.lat": "lat",
     "feature.location.lon": "lon",
+    "lat": "lat",
+    "lon": "lon",
     "feature.location.county": "building.county",
     "building.county": "building.county",
     "county": "building.county",

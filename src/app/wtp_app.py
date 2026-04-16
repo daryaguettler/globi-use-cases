@@ -651,8 +651,22 @@ def _render_census_tract_lookup() -> None:
                 building_lons: list[float] = []
 
                 if rect_col is not None:
+                    import base64
+                    from shapely import wkb as shapely_wkb
+
+                    def _load_geometry(s: str):
+                        """Parse WKT string or base64-encoded WKB (P3 format)."""
+                        try:
+                            return shapely_wkt.loads(s)
+                        except Exception:
+                            pass
+                        try:
+                            return shapely_wkb.loads(base64.b64decode(s))
+                        except Exception:
+                            return None
+
                     wkt_series = base_flat[rect_col].dropna().astype(str)
-                    geoms = wkt_series.map(lambda s: shapely_wkt.loads(s))
+                    geoms = wkt_series.map(_load_geometry).dropna()
                     gs = gpd.GeoSeries(geoms, crs="EPSG:3857").to_crs("EPSG:4326")
                     centroids = gs.centroid
                     building_lons = centroids.x.tolist()
