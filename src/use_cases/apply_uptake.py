@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import json
 import logging
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pathlib import Path
 from typing import Any
 
@@ -209,6 +209,7 @@ def method_dice_roll(
     years: list[int],
     rng: np.random.Generator | None = None,
     floor_threshold: float = 0.0,
+    attrition_rate: float = 0.0,
     building_id_col: str = "building_id",
     propensity_col: str = "acceptance_probability",
     scenario_col: str = "retrofit.scenario",
@@ -217,6 +218,12 @@ def method_dice_roll(
 
     Each year, non-adopted buildings draw u~U(0,1).  Those with
     propensity > u become candidates; highest propensity fills first.
+
+    attrition_rate is a last-minute dropout noise term: each year, a fraction
+    drawn from Uniform(0, attrition_rate) of the buildings that would have
+    adopted back out at the last minute.  This is *not* a post-adoption reversion
+    — once a building adopts it stays adopted.  The parameter widens the P10–P90
+    band in mc_ensemble runs without biasing the mean strongly downward.
 
     Returns a Series indexed by year with cumulative adoption as a percentage.
     """
@@ -248,7 +255,11 @@ def method_dice_roll(
             key=lambda b: propensity[b],
             reverse=True,
         )
-        for bid in candidates[:need]:
+        n_to_adopt = min(need, len(candidates))
+        if attrition_rate > 0.0 and n_to_adopt > 0:
+            dropout_fraction = resolved_rng.uniform(0.0, attrition_rate)
+            n_to_adopt = max(0, n_to_adopt - int(n_to_adopt * dropout_fraction))
+        for bid in candidates[:n_to_adopt]:
             adopted_set.add(bid)
             year_counts[year] += 1
             adopted_so_far += 1
@@ -299,6 +310,7 @@ def method_mc_ensemble(
     years: list[int],
     n_runs: int = 100,
     floor_threshold: float = 0.0,
+    attrition_rate: float = 0.0,
     seed: int = 0,
     ci_low: float = 10.0,
     ci_high: float = 90.0,
@@ -315,6 +327,7 @@ def method_mc_ensemble(
         years: Calendar years to iterate over.
         n_runs: Number of dice-roll repetitions.
         floor_threshold: Minimum propensity below which buildings are excluded.
+        attrition_rate: Last-minute dropout noise (see method_dice_roll).
         seed: Base seed for child RNGs.
         ci_low: Lower percentile for the confidence band (default 10).
         ci_high: Upper percentile for the confidence band (default 90).
@@ -335,6 +348,7 @@ def method_mc_ensemble(
             years,
             rng=np.random.default_rng(int(s)),
             floor_threshold=floor_threshold,
+            attrition_rate=attrition_rate,
             building_id_col=building_id_col,
             propensity_col=propensity_col,
             scenario_col=scenario_col,
@@ -349,7 +363,7 @@ def method_mc_ensemble(
     )
 
 
-class AdoptionEngine:
+class AdoptionEngine(BaseModel):
     """Engine for projecting retrofit uptake over time.
 
     Args:
@@ -372,25 +386,37 @@ class AdoptionEngine:
         income_brackets: Income bracket names used in net cost columns.
     """
 
-    def __init__(  # noqa: D107
-        self,
-        propensity_results_path: str | Path | None = None,
-        adoption_rates_path: str | Path | None = None,
-        propensity_df: pd.DataFrame | None = None,
-        params_path: str | Path | None = None,
-        acceptance_threshold: float = 0.50,
-        floor_threshold: float = 0.10,
-        adoption_scenario: str = "status_quo",
-        method: MethodName = "set_threshold",
-        start_year: int = 2025,
-        end_year: int = 2050,
-        n_ensemble_runs: int = 100,
-        random_seed: int = 42,
-        income_brackets: list[str] | None = None,
-    ):
-        self.params: dict = {}
-        if params_path is not None:
-            p = Path(params_path)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Input fields
+    propensity_results_path: Path | None = None
+    adoption_rates_path: Path | None = None
+    propensity_df: pd.DataFrame | None = None
+    params_path: Path | None = None
+    acceptance_threshold: float = 0.50
+    floor_threshold: float = 0.10
+    adoption_scenario: str = "status_quo"
+    method: MethodName = "set_threshold"
+    start_year: int = 2025
+    end_year: int = 2050
+    n_ensemble_runs: int = 100
+    random_seed: int = 42
+    income_brackets: list[str] = Field(default_factory=lambda: ["IncomeEligible", "AllCustomers"])
+
+    # Computed fields (set in model_post_init)
+    params: dict[str, Any] = Field(default_factory=dict)
+    adoption_scenario_name: str = "status_quo"
+    threshold_by_scenario: dict[str, float] = Field(default_factory=dict)
+    data: pd.DataFrame | None = None
+    adoption_rates: dict[str, Any] = Field(default_factory=dict)
+    adoption_scenario_obj: AdoptionScenario | None = None
+    curve: dict[int, float] = Field(default_factory=dict)
+    years: list[int] = Field(default_factory=list)
+
+    def model_post_init(self, __context: Any) -> None:
+        self.params = {}
+        if self.params_path is not None:
+            p = Path(self.params_path)
             if p.exists():
                 with open(p) as f:
                     self.params = yaml.safe_load(f) or {}
@@ -401,28 +427,23 @@ class AdoptionEngine:
         self.acceptance_threshold = float(
             uptake_cfg.get(
                 "acceptance_threshold",
-                prop_cfg.get("acceptance_threshold", acceptance_threshold),
+                prop_cfg.get("acceptance_threshold", self.acceptance_threshold),
             )
         )
-        self.floor_threshold = float(uptake_cfg.get("floor_threshold", floor_threshold))
-        self.adoption_scenario_name = str(
-            uptake_cfg.get("adoption_scenario", adoption_scenario)
-        )
-        self.method: MethodName = str(uptake_cfg.get("method", method))
-        self.start_year = int(uptake_cfg.get("start_year", start_year))
-        self.end_year = int(uptake_cfg.get("end_year", end_year))
-        self.n_ensemble_runs = int(uptake_cfg.get("n_ensemble_runs", n_ensemble_runs))
-        self.random_seed = int(uptake_cfg.get("random_seed", random_seed))
-        self.income_brackets = income_brackets or ["IncomeEligible", "AllCustomers"]
-        self.threshold_by_scenario: dict[str, float] = uptake_cfg.get(
-            "threshold_by_scenario", {}
-        )
+        self.floor_threshold = float(uptake_cfg.get("floor_threshold", self.floor_threshold))
+        self.adoption_scenario_name = str(uptake_cfg.get("adoption_scenario", self.adoption_scenario))
+        self.method = str(uptake_cfg.get("method", self.method))
+        self.start_year = int(uptake_cfg.get("start_year", self.start_year))
+        self.end_year = int(uptake_cfg.get("end_year", self.end_year))
+        self.n_ensemble_runs = int(uptake_cfg.get("n_ensemble_runs", self.n_ensemble_runs))
+        self.random_seed = int(uptake_cfg.get("random_seed", self.random_seed))
+        self.threshold_by_scenario = uptake_cfg.get("threshold_by_scenario", {})
 
         # Load propensity data
-        if propensity_df is not None:
-            self.data = propensity_df.copy()
-        elif propensity_results_path is not None:
-            self.data = pd.read_parquet(propensity_results_path)
+        if self.propensity_df is not None:
+            self.data = self.propensity_df.copy()
+        elif self.propensity_results_path is not None:
+            self.data = pd.read_parquet(self.propensity_results_path)
         else:
             msg = "Must provide propensity_results_path or propensity_df"
             raise ValueError(msg)
@@ -437,7 +458,7 @@ class AdoptionEngine:
             self.data["building_id"] = self.data.index.astype(str)
 
         # Load adoption curves
-        rates_path = Path(adoption_rates_path) if adoption_rates_path else None
+        rates_path = self.adoption_rates_path
         if rates_path is None:
             rates_path = Path(
                 self.params.get("paths", {}).get(
@@ -446,11 +467,11 @@ class AdoptionEngine:
             )
         self.adoption_rates = self._load_adoption_rates(rates_path)
         self.adoption_scenario_obj = self._get_adoption_scenario()
-        self.curve: dict[int, float] = {
+        self.curve = {
             int(y): min(float(v), 1.0)
             for y, v in self.adoption_scenario_obj.values.items()
         }
-        self.years: list[int] = list(range(self.start_year, self.end_year + 1))
+        self.years = list(range(self.start_year, self.end_year + 1))
 
         logger.info(
             f"Loaded {len(self.data)} propensity rows; method={self.method}; scenario={self.adoption_scenario_name}"
@@ -530,6 +551,7 @@ class AdoptionEngine:
             else ["default"]
         )
         yearly_rows: list[dict] = []
+        attrition = self.adoption_scenario_obj.annual_attrition
 
         for scenario in scenarios:
             sub = (
@@ -557,6 +579,7 @@ class AdoptionEngine:
                     self.years,
                     rng=rng,
                     floor_threshold=self.floor_threshold,
+                    attrition_rate=attrition,
                 )
                 self._append_yearly_rows(
                     yearly_rows, scenario, series, n, method="dice_roll"
@@ -583,6 +606,7 @@ class AdoptionEngine:
                     n_runs=self.n_ensemble_runs,
                     seed=self.random_seed,
                     floor_threshold=self.floor_threshold,
+                    attrition_rate=attrition,
                 )
                 self._append_yearly_rows(
                     yearly_rows,

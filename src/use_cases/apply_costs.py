@@ -35,12 +35,12 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +121,7 @@ def compute_equipment_quantities(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@dataclass
-class CostDistribution:
+class CostDistribution(BaseModel):
     """Summary statistics for a cost distribution."""
 
     mean: float
@@ -172,8 +171,10 @@ class CostDistribution:
 # ── Quantity factor types ─────────────────────────────────────────────────────
 
 
-class QuantityFactor:
+class QuantityFactor(BaseModel):
     """Base class for quantity factors."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def compute(
         self,
@@ -185,11 +186,10 @@ class QuantityFactor:
 
 
 class FixedQuantity(QuantityFactor):
-    def __init__(self, amount: float, error_scale: float | None = None, description: str = "", source: str = ""):
-        self.amount = amount
-        self.error_scale = error_scale
-        self.description = description
-        self.source = source
+    amount: float
+    error_scale: float | None = None
+    description: str = ""
+    source: str = ""
 
     def compute(self, features: pd.DataFrame, context_df: pd.DataFrame | None = None, trigger_column: str | None = None) -> pd.Series:
         if self.error_scale is None or self.error_scale == 0:
@@ -201,14 +201,13 @@ class FixedQuantity(QuantityFactor):
 
 
 class LinearQuantity(QuantityFactor):
-    def __init__(self, coefficient: float, indicator_cols: list[str], error_scale: float | None = None, units: str = "", per: str = "", description: str = "", source: str = ""):
-        self.coefficient = coefficient
-        self.indicator_cols = indicator_cols
-        self.error_scale = error_scale
-        self.units = units
-        self.per = per
-        self.description = description
-        self.source = source
+    coefficient: float
+    indicator_cols: list[str]
+    error_scale: float | None = None
+    units: str = ""
+    per: str = ""
+    description: str = ""
+    source: str = ""
 
     def compute(self, features: pd.DataFrame, context_df: pd.DataFrame | None = None, trigger_column: str | None = None) -> pd.Series:
         available = [c for c in self.indicator_cols if c in features.columns]
@@ -224,13 +223,12 @@ class LinearQuantity(QuantityFactor):
 
 
 class PercentQuantity(QuantityFactor):
-    def __init__(self, percent: float, limit: float | None = None, limit_unit: str | None = None, error_scale: float | None = None, description: str = "", source: str = ""):
-        self.percent = percent
-        self.limit = limit
-        self.limit_unit = limit_unit
-        self.error_scale = error_scale
-        self.description = description
-        self.source = source
+    percent: float
+    limit: float | None = None
+    limit_unit: str | None = None
+    error_scale: float | None = None
+    description: str = ""
+    source: str = ""
 
     def compute(self, features: pd.DataFrame, context_df: pd.DataFrame | None = None, trigger_column: str | None = None) -> pd.Series:
         if context_df is None:
@@ -254,15 +252,16 @@ class PercentQuantity(QuantityFactor):
         return base_quantity
 
 
-class RetrofitQuantity:
+class RetrofitQuantity(BaseModel):
     """Single retrofit quantity (cost or incentive) for one upgrade transition."""
 
-    def __init__(self, trigger_column: str, initial: str | None, final: str, quantity_factors: list[QuantityFactor], order: list[str]):
-        self.trigger_column = trigger_column
-        self.initial = initial
-        self.final = final
-        self.quantity_factors = quantity_factors
-        self.order = order
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    trigger_column: str
+    initial: str | None
+    final: str
+    quantity_factors: list[QuantityFactor]
+    order: list[str]
 
     def compute(self, features: pd.DataFrame, context_df: pd.DataFrame | None = None, output_key: str = "cost") -> pd.Series:
         if not self.quantity_factors:
@@ -281,15 +280,16 @@ class RetrofitQuantity:
         return total.rename(f"{output_key}.{self.trigger_column}")
 
 
-class RetrofitQuantities:
+class RetrofitQuantities(BaseModel):
     """Collection of retrofit quantity definitions loaded from JSON."""
 
-    def __init__(self, quantities: list[RetrofitQuantity], output_key: str = "cost", raise_on_duplicate_trigger: bool = True, create_metadata: bool = False, metadata_aggregation: str | None = None):
-        self.quantities = quantities
-        self.output_key = output_key
-        self.raise_on_duplicate_trigger = raise_on_duplicate_trigger
-        self.create_metadata = create_metadata
-        self.metadata_aggregation = metadata_aggregation
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    quantities: list[RetrofitQuantity]
+    output_key: str = "cost"
+    raise_on_duplicate_trigger: bool = True
+    create_metadata: bool = False
+    metadata_aggregation: str | None = None
 
     @classmethod
     def from_json(cls, path: Path) -> "RetrofitQuantities":
@@ -323,9 +323,10 @@ class RetrofitQuantities:
         return df
 
 
-@dataclass
-class ScenarioCostResult:
+class ScenarioCostResult(BaseModel):
     """Result container for a single scenario cost calculation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     scenario_name: str
     n_samples: int
@@ -358,7 +359,7 @@ class ScenarioCostResult:
         return result
 
 
-class RetrofitScenarioAnalyzer:
+class RetrofitScenarioAnalyzer(BaseModel):
     """Compute retrofit costs, incentives, and energy savings from simulation output.
 
     Args:
@@ -380,42 +381,42 @@ class RetrofitScenarioAnalyzer:
             ``"baseline"``; the first scenario found is used as fallback.
     """
 
-    def __init__(
-        self,
-        model_output_path: str | Path,
-        costs_path: str | Path | None = None,
-        incentives_path: str | Path | None = None,
-        energy_costs_path: str | Path | None = None,
-        energy_cost_year: str = "2025",
-        income_brackets: list[str] | None = None,
-        counties: list[str] | None = None,
-        region: str | None = None,
-        baseline_scenario: str = "baseline",
-    ):
-        self.model_output_path = Path(model_output_path)
-        self.energy_cost_year = energy_cost_year
-        self.income_brackets = income_brackets or DEFAULT_INCOME_BRACKETS
-        self.counties = counties or []
-        self.region = region
-        self.baseline_scenario = baseline_scenario
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    # Input fields
+    model_output_path: Path
+    costs_path: Path | None = None
+    incentives_path: Path | None = None
+    energy_costs_path: Path | None = None
+    energy_cost_year: str = "2025"
+    income_brackets: list[str] = Field(default_factory=lambda: list(DEFAULT_INCOME_BRACKETS))
+    counties: list[str] = Field(default_factory=list)
+    region: str | None = None
+    baseline_scenario: str = "baseline"
+
+    # Computed fields (set in model_post_init)
+    cost_config: RetrofitQuantities | None = None
+    incentive_config: RetrofitQuantities | None = None
+    energy_costs: dict[str, float] = Field(default_factory=dict)
+    model_output: pd.DataFrame | None = None
+
+    def model_post_init(self, __context: Any) -> None:
         data_dir = Path(__file__).parent.parent.parent / "inputs" / "costs"
-        self.costs_path = Path(costs_path) if costs_path else data_dir / "retrofit_costs.json"
-        self.incentives_path = Path(incentives_path) if incentives_path else data_dir / "incentives.json"
-        self.energy_costs_path = Path(energy_costs_path) if energy_costs_path else data_dir / "energy_costs.json"
+        costs_path = self.costs_path or data_dir / "retrofit_costs.json"
+        incentives_path = self.incentives_path or data_dir / "incentives.json"
+        energy_costs_path = self.energy_costs_path or data_dir / "energy_costs.json"
 
-        self.cost_config = RetrofitQuantities.from_json(self.costs_path)
-        self.incentive_config = RetrofitQuantities.from_json(self.incentives_path)
-        self.energy_costs = self._load_energy_costs()
-
+        self.cost_config = RetrofitQuantities.from_json(costs_path)
+        self.incentive_config = RetrofitQuantities.from_json(incentives_path)
+        self.energy_costs = self._load_energy_costs(energy_costs_path)
         self.model_output = pd.read_parquet(self.model_output_path)
         logger.info(f"Loaded model output: {len(self.model_output)} rows, {len(self.model_output.columns)} columns")
 
-    def _load_energy_costs(self) -> dict[str, float]:
-        if not self.energy_costs_path.exists():
-            logger.warning(f"Energy costs file not found: {self.energy_costs_path}, using defaults")
+    def _load_energy_costs(self, path: Path) -> dict[str, float]:
+        if not path.exists():
+            logger.warning(f"Energy costs file not found: {path}, using defaults")
             return {"electricity": 0.22, "natural_gas": 0.05, "fuel_oil": 0.10, "propane": 0.08}
-        with open(self.energy_costs_path) as f:
+        with open(path) as f:
             data = json.load(f)
         y = self.energy_cost_year
         costs: dict[str, float] = {}

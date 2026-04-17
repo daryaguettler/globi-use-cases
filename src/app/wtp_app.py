@@ -59,6 +59,9 @@ _EMISSIONS_PATH = _DATA_DIR / "emissions_trajectories.json"
 _CONFIGS_DIR = _REPO_ROOT / "data" / "outputs"
 _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
 
+_SCENARIOS_DIR = _REPO_ROOT / "outputs"
+_SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
+
 _YEARS_RANGE = list(range(2024, 2101))
 _PROJECTION_YEARS = list(range(2025, 2101))
 
@@ -226,6 +229,109 @@ def _load_config(name: str) -> bool:
     return True
 
 
+# ── Scenario results saving/loading ───────────────────────────────────────────
+
+def _list_saved_scenarios() -> list[str]:
+    """Return sorted list of scenario names found in outputs/."""
+    if not _SCENARIOS_DIR.exists():
+        return []
+    return sorted(
+        p.name for p in _SCENARIOS_DIR.iterdir()
+        if p.is_dir() and (p / "metadata.json").exists()
+    )
+
+
+def _save_scenario_results(name: str) -> None:
+    """Save current run results to outputs/{name}/."""
+    import datetime
+
+    scenario_dir = _SCENARIOS_DIR / name
+    scenario_dir.mkdir(parents=True, exist_ok=True)
+
+    scenario_results: dict = st.session_state.get("scenario_results", {})
+    policy_impacts: pd.DataFrame | None = st.session_state.get("policy_impacts")
+    propensity_result = st.session_state.get("propensity_result")
+    simulated_years = st.session_state.get("simulated_years", [])
+
+    # Metadata
+    metadata = {
+        "scenario_name": name,
+        "run_name": st.session_state.get("scenario_name", "Retrofit"),
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "n_buildings": len(policy_impacts) if policy_impacts is not None else 0,
+        "simulated_years": simulated_years,
+        "mean_acceptance_probability": (
+            float(propensity_result.mean_acceptance_probability)
+            if propensity_result is not None else None
+        ),
+        "n_adoption_scenarios": len(scenario_results),
+        "adoption_scenario_names": list(scenario_results.keys()),
+    }
+    (scenario_dir / "metadata.json").write_text(json.dumps(metadata, indent=4))
+
+    # Config snapshot
+    incentive_cfg: IncentiveConfig = st.session_state.get("incentive_config", IncentiveConfig())
+    config = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "adoption_curves": _load_adoption_curves(),
+        "emissions_trajectories": _load_emissions_json(),
+        "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
+        "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
+        "incentive_config": incentive_cfg.model_dump(),
+    }
+    (scenario_dir / "config.json").write_text(json.dumps(config, indent=4))
+
+    # Emissions trajectories CSV
+    em_frames = []
+    for scen_name, res in scenario_results.items():
+        em = res["emissions"]
+        if not em.empty:
+            em_frames.append(em.assign(adoption_scenario=scen_name))
+    if em_frames:
+        pd.concat(em_frames).to_csv(scenario_dir / "emissions_trajectories.csv", index=False)
+
+    # Adoption summaries CSV (include adoption_scenario column)
+    adoption_frames = []
+    for scen_name, res in scenario_results.items():
+        ys = res["uptake"].yearly_summary
+        if not ys.empty:
+            adoption_frames.append(ys.assign(adoption_scenario=scen_name))
+    if adoption_frames:
+        pd.concat(adoption_frames).to_csv(scenario_dir / "adoption_summaries.csv", index=False)
+
+    # Policy impacts CSV
+    if policy_impacts is not None:
+        policy_impacts.to_csv(scenario_dir / "policy_impacts.csv", index=False)
+
+
+def _load_scenario_data(name: str) -> dict | None:
+    """Load saved scenario data from outputs/{name}/."""
+    scenario_dir = _SCENARIOS_DIR / name
+    if not scenario_dir.exists():
+        return None
+
+    data: dict = {}
+
+    metadata_path = scenario_dir / "metadata.json"
+    if metadata_path.exists():
+        data["metadata"] = json.loads(metadata_path.read_text())
+
+    emissions_path = scenario_dir / "emissions_trajectories.csv"
+    if emissions_path.exists():
+        data["emissions"] = pd.read_csv(emissions_path)
+
+    adoption_path = scenario_dir / "adoption_summaries.csv"
+    if adoption_path.exists():
+        data["adoption"] = pd.read_csv(adoption_path)
+
+    policy_path = scenario_dir / "policy_impacts.csv"
+    if policy_path.exists():
+        data["policy_impacts"] = pd.read_csv(policy_path)
+
+    return data
+
+
 def _render_config_manager() -> None:
     """Sidebar panel for saving and loading named configurations."""
     st.sidebar.title("Configurations")
@@ -351,52 +457,133 @@ def _render_upload_tab() -> None:
         st.warning("Duplicate years — each year should appear only once.")
     st.session_state["selected_years"] = selected_years
 
-    # ── Per-year file uploaders ────────────────────────────────────────────────
+    # ── Input mode toggle ─────────────────────────────────────────────────────
     st.divider()
+    upload_mode = st.radio(
+        "File input method",
+        ["Upload files", "Browse directory"],
+        horizontal=True,
+        key="upload_mode",
+        help=(
+            "**Upload files** — drag-and-drop or click to upload parquet files directly. "
+            "**Browse directory** — point to a folder on the server and pick files from dropdowns."
+        ),
+    )
+
     year_files: dict = st.session_state.get("year_files", {})
 
-    for yr in selected_years:
-        with st.expander(f"Year {yr}", expanded=True):
-            col_b, col_s = st.columns(2)
-            entry = year_files.get(yr, {})
+    # ── Browse directory mode ─────────────────────────────────────────────────
+    if upload_mode == "Browse directory":
+        dir_input = st.text_input(
+            "Data directory path",
+            placeholder="e.g. /code/data/inputs/example-p3  or  /Users/me/simulations",
+            key="dir_browse_path",
+            help="Absolute path to a folder containing .pq or .parquet files. Sub-folders are included.",
+        )
+        dir_p = Path(dir_input.strip()) if dir_input.strip() else None
 
-            with col_b:
-                st.markdown("**Baseline**")
-                base_file = st.file_uploader(
-                    f"Baseline {yr}", type=["pq", "parquet"],
-                    key=f"base_file_{yr}", label_visibility="collapsed",
+        if dir_p is not None:
+            if not dir_p.exists() or not dir_p.is_dir():
+                st.error(f"Directory not found: `{dir_p}`")
+            else:
+                pq_files = sorted(
+                    list(dir_p.glob("**/*.pq")) + list(dir_p.glob("**/*.parquet"))
                 )
-                if base_file is not None:
-                    data = base_file.read()
-                    entry = {**entry, "baseline": data}
-                    st.session_state["_example_preloaded"] = False
-                    info = _preview_parquet(data)
-                    if "error" in info:
-                        st.error(info["error"])
-                    else:
-                        _show_file_kpis(info, "Baseline")
-                elif entry.get("baseline") is not None:
-                    st.caption("✓ Previously uploaded")
+                if not pq_files:
+                    st.warning("No `.pq` or `.parquet` files found in this directory.")
+                else:
+                    rel_paths = [str(f.relative_to(dir_p)) for f in pq_files]
+                    file_options = ["— select —"] + rel_paths
+                    st.caption(f"Found **{len(pq_files)}** parquet file(s) in `{dir_p}`.")
+                    st.divider()
 
-            with col_s:
-                st.markdown(f"**{st.session_state['scenario_name']}**")
-                scen_file = st.file_uploader(
-                    f"Scenario {yr}", type=["pq", "parquet"],
-                    key=f"scen_file_{yr}", label_visibility="collapsed",
-                )
-                if scen_file is not None:
-                    data = scen_file.read()
-                    entry = {**entry, "scenario": data}
-                    st.session_state["_example_preloaded"] = False
-                    info = _preview_parquet(data)
-                    if "error" in info:
-                        st.error(info["error"])
-                    else:
-                        _show_file_kpis(info, st.session_state["scenario_name"])
-                elif entry.get("scenario") is not None:
-                    st.caption("✓ Previously uploaded")
+                    for yr in selected_years:
+                        with st.expander(f"Year {yr}", expanded=True):
+                            col_b, col_s = st.columns(2)
+                            entry = year_files.get(yr, {})
 
-            year_files[yr] = entry
+                            with col_b:
+                                st.markdown("**Baseline**")
+                                base_sel = st.selectbox(
+                                    f"Baseline {yr}", options=file_options,
+                                    key=f"dir_base_{yr}", label_visibility="collapsed",
+                                )
+                                if base_sel != "— select —":
+                                    data = (dir_p / base_sel).read_bytes()
+                                    entry = {**entry, "baseline": data}
+                                    st.session_state["_example_preloaded"] = False
+                                    info = _preview_parquet(data)
+                                    if "error" in info:
+                                        st.error(info["error"])
+                                    else:
+                                        _show_file_kpis(info, "Baseline")
+                                elif entry.get("baseline") is not None:
+                                    st.caption("✓ Previously selected")
+
+                            with col_s:
+                                st.markdown(f"**{st.session_state['scenario_name']}**")
+                                scen_sel = st.selectbox(
+                                    f"Scenario {yr}", options=file_options,
+                                    key=f"dir_scen_{yr}", label_visibility="collapsed",
+                                )
+                                if scen_sel != "— select —":
+                                    data = (dir_p / scen_sel).read_bytes()
+                                    entry = {**entry, "scenario": data}
+                                    st.session_state["_example_preloaded"] = False
+                                    info = _preview_parquet(data)
+                                    if "error" in info:
+                                        st.error(info["error"])
+                                    else:
+                                        _show_file_kpis(info, st.session_state["scenario_name"])
+                                elif entry.get("scenario") is not None:
+                                    st.caption("✓ Previously selected")
+
+                            year_files[yr] = entry
+
+    # ── Upload files mode (original) ──────────────────────────────────────────
+    else:
+        for yr in selected_years:
+            with st.expander(f"Year {yr}", expanded=True):
+                col_b, col_s = st.columns(2)
+                entry = year_files.get(yr, {})
+
+                with col_b:
+                    st.markdown("**Baseline**")
+                    base_file = st.file_uploader(
+                        f"Baseline {yr}", type=["pq", "parquet"],
+                        key=f"base_file_{yr}", label_visibility="collapsed",
+                    )
+                    if base_file is not None:
+                        data = base_file.read()
+                        entry = {**entry, "baseline": data}
+                        st.session_state["_example_preloaded"] = False
+                        info = _preview_parquet(data)
+                        if "error" in info:
+                            st.error(info["error"])
+                        else:
+                            _show_file_kpis(info, "Baseline")
+                    elif entry.get("baseline") is not None:
+                        st.caption("✓ Previously uploaded")
+
+                with col_s:
+                    st.markdown(f"**{st.session_state['scenario_name']}**")
+                    scen_file = st.file_uploader(
+                        f"Scenario {yr}", type=["pq", "parquet"],
+                        key=f"scen_file_{yr}", label_visibility="collapsed",
+                    )
+                    if scen_file is not None:
+                        data = scen_file.read()
+                        entry = {**entry, "scenario": data}
+                        st.session_state["_example_preloaded"] = False
+                        info = _preview_parquet(data)
+                        if "error" in info:
+                            st.error(info["error"])
+                        else:
+                            _show_file_kpis(info, st.session_state["scenario_name"])
+                    elif entry.get("scenario") is not None:
+                        st.caption("✓ Previously uploaded")
+
+                year_files[yr] = entry
 
     st.session_state["year_files"] = year_files
 
@@ -524,13 +711,15 @@ def _render_config_tab() -> None:
 
     if is_us:
         st.markdown(
-            "Census tract demographics will be looked up automatically from building "
-            "lat/lon coordinates in the uploaded files.  Optionally upload a pre-built "
-            "census CSV (same format as `data/inputs/climate_opinions.csv`) to skip "
-            "API calls."
+            "Without a census file, the app calls the Census Geocoder and ACS APIs once "
+            "per **distinct** building location (rounded lat/lon) and once per census tract "
+            "— fast for a single tract, slower for scattered sites. Upload a **tract-level** "
+            "tract-level census CSV (income, education, and household columns per tract, "
+            "same schema as the engine's census_data_path input) "
+            "to skip those calls entirely and use precomputed distributions."
         )
         census_file = st.file_uploader(
-            "Census CSV (optional — leave blank for API lookup)",
+            "Census CSV (optional — skips geocoder + ACS when set)",
             type=["csv"], key="cfg_census_csv",
         )
         if census_file is not None:
@@ -747,12 +936,57 @@ def _render_census_tract_lookup() -> None:
 # TAB 3 — ADOPTION CURVES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _ac_compute_curve(shape: str, start: float, end: float, n: int) -> np.ndarray:
+# ── Reserved (locked) adoption scenarios ──────────────────────────────────────
+# These are always present and cannot be edited or removed.
+_RESERVED_SCENARIOS: dict[str, dict] = {
+    "no_adoption": {
+        "description": "No adoption — 0% throughout (baseline reference)",
+        "curve_type": "flat",
+        "max_adoption": 0.0,
+        "annual_attrition": 0.0,
+        "locked": True,
+        "values": {str(y): 0.0 for y in range(2024, 2101)},
+    },
+    "full_adoption": {
+        "description": "Full adoption — 100% throughout (theoretical maximum)",
+        "curve_type": "flat",
+        "max_adoption": 1.0,
+        "annual_attrition": 0.0,
+        "locked": True,
+        "values": {str(y): 1.0 for y in range(2024, 2101)},
+    },
+}
+
+
+def _ensure_reserved_scenarios(raw: dict) -> tuple[dict, bool]:
+    """Inject no_adoption / full_adoption if missing. Returns (raw, was_changed)."""
+    changed = False
+    scenarios = raw.setdefault("scenarios", {})
+    for name, template in _RESERVED_SCENARIOS.items():
+        if name not in scenarios:
+            scenarios[name] = copy.deepcopy(template)
+            changed = True
+    return raw, changed
+
+
+def _ac_compute_curve(
+    shape: str,
+    start: float,
+    end: float,
+    n: int,
+    sigmoid_midpoint: float = 0.5,
+    sigmoid_steepness: float = 10.0,
+) -> np.ndarray:
+    """Compute n adoption-rate values from start→end using the chosen shape.
+
+    sigmoid_midpoint  — 0-to-1 fraction of the timeline where the curve inflects.
+    sigmoid_steepness — controls how sharply the curve transitions (higher = steeper).
+    """
     xs = np.linspace(0, 1, n)
     if shape == "Linear":
         return start + (end - start) * xs
     if shape == "Sigmoid":
-        sig = 1 / (1 + np.exp(-10 * (xs - 0.5)))
+        sig = 1 / (1 + np.exp(-sigmoid_steepness * (xs - sigmoid_midpoint)))
         sig = (sig - sig[0]) / (sig[-1] - sig[0] + 1e-9)
         return start + (end - start) * sig
     # Exponential
@@ -761,183 +995,323 @@ def _ac_compute_curve(shape: str, start: float, end: float, n: int) -> np.ndarra
     return start + (end - start) * exp_raw
 
 
+def _ac_scenario_editor(
+    prefix: str,
+    curve_years: list[int],
+    defaults: dict,
+) -> dict:
+    """Render the parameter widgets for one adoption scenario.
+
+    prefix   — unique key prefix to avoid widget-key collisions.
+    defaults — existing scenario dict used to pre-fill values.
+    Returns a dict of the current widget values (not yet saved).
+    """
+    shape_opts = ["Linear", "Sigmoid", "Exponential"]
+    saved_shape = defaults.get("curve_type", "linear").capitalize()
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        shape = st.selectbox(
+            "Curve shape", shape_opts,
+            index=shape_opts.index(saved_shape) if saved_shape in shape_opts else 0,
+            key=f"{prefix}_shape",
+            help=(
+                "**Linear** — adoption grows at a steady, constant rate each year.\n\n"
+                "**Sigmoid** — slow start, rapid acceleration in the middle years, then "
+                "flattening as saturation approaches. Good for most realistic programs.\n\n"
+                "**Exponential** — slow start that accelerates throughout, never plateauing "
+                "until it hits the max cap. Best for disruptive/rapid-uptake scenarios."
+            ),
+        )
+    with col2:
+        start_val = st.number_input(
+            "Start adoption (2024)", min_value=0.0, max_value=1.0,
+            value=float(defaults.get("values", {}).get("2024", 0.0)),
+            step=0.01, format="%.2f", key=f"{prefix}_start",
+            help="Fraction of buildings adopted at the beginning of the projection (0 = none, 1 = all).",
+        )
+    with col3:
+        saved_end = float(
+            defaults.get("values", {}).get("2100")
+            or defaults.get("values", {}).get("2050")
+            or defaults.get("max_adoption", 0.85)
+        )
+        end_val = st.number_input(
+            "End adoption (2100)", min_value=0.0, max_value=1.0,
+            value=saved_end,
+            step=0.01, format="%.2f", key=f"{prefix}_end",
+            help="Target fraction adopted by the end of the projection horizon.",
+        )
+
+    # Sigmoid-specific controls
+    sigmoid_mid = defaults.get("sigmoid_midpoint", 0.5)
+    sigmoid_steep = defaults.get("sigmoid_steepness", 10.0)
+    if shape == "Sigmoid":
+        s_col1, s_col2 = st.columns(2)
+        proj_span = curve_years[-1] - curve_years[0]
+        saved_infl_year = int(curve_years[0] + sigmoid_mid * proj_span)
+        with s_col1:
+            infl_year = st.slider(
+                "Inflection year",
+                min_value=curve_years[0], max_value=curve_years[-1],
+                value=saved_infl_year,
+                key=f"{prefix}_infl",
+                help=(
+                    "The year when adoption growth is fastest. "
+                    "Before this year growth is slow; after it, growth decelerates toward the cap."
+                ),
+            )
+            sigmoid_mid = (infl_year - curve_years[0]) / proj_span
+        with s_col2:
+            sigmoid_steep = st.slider(
+                "Steepness", min_value=2.0, max_value=20.0,
+                value=float(sigmoid_steep),
+                step=0.5,
+                key=f"{prefix}_steep",
+                help=(
+                    "How sharply the curve transitions around the inflection year. "
+                    "Low (~2–4): gradual S. High (~15–20): near step-change."
+                ),
+            )
+
+    st.divider()
+    cap_col, attr_col, desc_col = st.columns(3)
+    with cap_col:
+        max_adoption = st.number_input(
+            "Maximum adoption cap", min_value=0.0, max_value=1.0,
+            value=float(defaults.get("max_adoption", 0.85)),
+            step=0.01, format="%.2f", key=f"{prefix}_max",
+            help=(
+                "Hard ceiling on adoption regardless of curve shape. "
+                "Set to 1.0 to allow 100% adoption, or lower to reflect "
+                "structural limits (e.g. renters, exempt buildings)."
+            ),
+        )
+    with attr_col:
+        annual_attrition = st.number_input(
+            "Last-minute dropout rate", min_value=0.0, max_value=1.0,
+            value=float(defaults.get("annual_attrition", 0.02)),
+            step=0.005, format="%.3f", key=f"{prefix}_attr",
+            help=(
+                "A noise term on each year's adoption. Each year, a random fraction "
+                "between **0 and this value** of buildings that were about to adopt "
+                "back out at the last minute — for example due to financing falling "
+                "through or late-stage cold feet. **Once a building adopts it stays "
+                "adopted** (this is not a reversion rate). "
+                "Set to **0.00** for a noise-free deterministic curve; "
+                "**0.05** adds up to 5 % annual last-minute dropout uncertainty, "
+                "which widens the P10–P90 band in the MC ensemble."
+            ),
+        )
+    with desc_col:
+        description = st.text_input(
+            "Description (optional)", value=defaults.get("description", ""),
+            key=f"{prefix}_desc",
+        )
+
+    return {
+        "shape": shape,
+        "start_val": start_val,
+        "end_val": end_val,
+        "sigmoid_midpoint": sigmoid_mid,
+        "sigmoid_steepness": sigmoid_steep,
+        "max_adoption": max_adoption,
+        "annual_attrition": annual_attrition,
+        "description": description,
+    }
+
+
+def _ac_build_scenario_dict(params: dict, curve_years: list[int]) -> dict:
+    """Build a scenario data dict from editor widget output."""
+    preview_ys = np.clip(
+        _ac_compute_curve(
+            params["shape"],
+            params["start_val"],
+            params["end_val"],
+            len(curve_years),
+            sigmoid_midpoint=params["sigmoid_midpoint"],
+            sigmoid_steepness=params["sigmoid_steepness"],
+        ),
+        0.0,
+        params["max_adoption"],
+    )
+    return {
+        "description": params["description"],
+        "curve_type": params["shape"].lower(),
+        "max_adoption": params["max_adoption"],
+        "annual_attrition": params["annual_attrition"],
+        "sigmoid_midpoint": params["sigmoid_midpoint"],
+        "sigmoid_steepness": params["sigmoid_steepness"],
+        "values": {str(y): round(float(v), 4) for y, v in zip(curve_years, preview_ys)},
+    }
+
+
 def _render_adoption_tab() -> None:
     st.markdown("## Step 3 — Adoption Curves")
+    st.caption(
+        "Define how retrofit adoption evolves over time. "
+        "**No adoption** and **Full adoption** are always included as reference bounds. "
+        "Add your own scenarios below."
+    )
 
     raw = _load_adoption_curves()
+    # Ensure reserved scenarios are present; save if they were missing
+    raw, reserved_added = _ensure_reserved_scenarios(raw)
+    if reserved_added:
+        _save_adoption_curves(raw)
+
     scenarios: dict = raw.get("scenarios", {})
     curve_years = list(range(2024, 2101))
     colors = _curve_colors()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 1 — Manage scenarios (add / remove)
+    # SECTION 1 — Scenario list
     # ══════════════════════════════════════════════════════════════════════════
-    st.markdown("### Manage Scenarios")
-    st.caption("Add new scenarios or remove existing ones before parametrizing.")
+    st.markdown("### Scenarios")
 
-    # List existing scenarios with remove buttons
-    if scenarios:
-        for sname in list(scenarios.keys()):
-            row_col, btn_col = st.columns([6, 1], vertical_alignment="center")
-            with row_col:
-                desc = scenarios[sname].get("description", "")
-                st.markdown(f"**{sname}**" + (f" — _{desc}_" if desc else ""))
-            with btn_col:
-                remove_disabled = len(scenarios) <= 1
-                if st.button(
-                    "Remove", key=f"rm_{sname}",
-                    disabled=remove_disabled,
-                    help="Cannot remove the last scenario." if remove_disabled else None,
-                ):
-                    del raw["scenarios"][sname]
-                    _save_adoption_curves(raw)
-                    # Switch active selection away from deleted scenario
-                    if st.session_state.get("adoption_scenario") == sname:
-                        remaining = [k for k in raw.get("scenarios", {}) if k != sname]
-                        st.session_state["adoption_scenario"] = remaining[0] if remaining else None
-                    st.rerun()
-    else:
-        st.info("No scenarios yet — add one below to get started.")
+    user_scenarios = {k: v for k, v in scenarios.items() if not v.get("locked")}
+    locked_scenarios = {k: v for k, v in scenarios.items() if v.get("locked")}
 
-    # Add new scenario row
-    add_col1, add_col2, _ = st.columns([3, 1, 4], vertical_alignment="bottom")
-    with add_col1:
-        new_name = st.text_input(
-            "New scenario name", placeholder="e.g. fast_2030", key="ac_new_name",
-        )
-    with add_col2:
-        if st.button("Add scenario", key="ac_add_btn", type="secondary"):
-            n = new_name.strip()
-            if not n:
-                st.error("Enter a name.")
-            elif n in scenarios:
-                st.error(f"'{n}' already exists.")
-            else:
-                template = {
-                    "description": "", "curve_type": "linear",
-                    "max_adoption": 0.85, "annual_attrition": 0.05,
-                    "values": {str(y): 0.0 for y in curve_years},
-                }
-                raw["scenarios"][n] = template
+    # Locked reference scenarios (no remove button, no editor)
+    for sname, sdata in locked_scenarios.items():
+        lk_col, desc_col = st.columns([2, 6])
+        with lk_col:
+            st.markdown(f"🔒 **{sname}**")
+        with desc_col:
+            st.caption(sdata.get("description", ""))
+
+    if user_scenarios:
+        st.markdown("")  # spacing
+    for sname in list(user_scenarios.keys()):
+        row_col, btn_col = st.columns([7, 1], vertical_alignment="center")
+        with row_col:
+            desc = scenarios[sname].get("description", "")
+            st.markdown(f"**{sname}**" + (f" — _{desc}_" if desc else ""))
+        with btn_col:
+            if st.button("Remove", key=f"rm_{sname}"):
+                del raw["scenarios"][sname]
                 _save_adoption_curves(raw)
-                st.session_state["adoption_scenario"] = n
+                if st.session_state.get("adoption_scenario") == sname:
+                    remaining = [k for k in raw.get("scenarios", {}) if not raw["scenarios"][k].get("locked")]
+                    st.session_state["adoption_scenario"] = remaining[0] if remaining else None
                 st.rerun()
 
-    if not scenarios:
-        st.divider()
-        _ac_render_projection_period()
-        return
+    if not user_scenarios:
+        st.info("No custom scenarios yet — create one below.")
 
     st.divider()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # SECTION 2 — Parametrize selected scenario
+    # SECTION 2 — Edit existing scenario
     # ══════════════════════════════════════════════════════════════════════════
-    st.markdown("### Parametrize")
-    st.caption(
-        "Select a scenario and adjust its shape. Changes preview live — click "
-        "**Save curve** to persist."
-    )
+    if user_scenarios:
+        st.markdown("### Edit Scenario")
+        st.caption("Adjust the curve shape — the preview updates live. Click **Save** to persist.")
 
-    scenario_names = list(scenarios.keys())
-    default_sel = st.session_state.get("adoption_scenario")
-    sel_idx = scenario_names.index(default_sel) if default_sel in scenario_names else 0
-    selected = st.selectbox(
-        "Scenario to edit", options=scenario_names,
-        index=sel_idx, key="ac_selected",
-    )
-    st.session_state["adoption_scenario"] = selected
+        scenario_names = list(user_scenarios.keys())
+        default_sel = st.session_state.get("adoption_scenario")
+        sel_idx = scenario_names.index(default_sel) if default_sel in scenario_names else 0
+        selected = st.selectbox(
+            "Scenario to edit", options=scenario_names,
+            index=sel_idx, key="ac_selected",
+        )
+        st.session_state["adoption_scenario"] = selected
 
-    scen_data = copy.deepcopy(scenarios[selected])
+        scen_data = copy.deepcopy(scenarios[selected])
+        params = _ac_scenario_editor("edit", curve_years, scen_data)
+        updated = _ac_build_scenario_dict(params, curve_years)
 
-    p_col1, p_col2, p_col3 = st.columns(3)
-    with p_col1:
-        shape_opts = ["Linear", "Sigmoid", "Exponential"]
-        saved_shape = scen_data.get("curve_type", "linear").capitalize()
-        qf_shape = st.selectbox(
-            "Curve shape", shape_opts,
-            index=shape_opts.index(saved_shape) if saved_shape in shape_opts else 0,
-            key="qf_shape",
-            help="Linear: constant rate. Sigmoid: slow start, fast middle, slow end. Exponential: accelerating.",
-        )
-    with p_col2:
-        qf_start = st.number_input(
-            "Start adoption (2024)", min_value=0.0, max_value=1.0,
-            value=float(scen_data.get("values", {}).get("2024", 0.0)),
-            step=0.01, format="%.2f", key="qf_start",
-        )
-    with p_col3:
-        qf_end = st.number_input(
-            "End adoption (2100)", min_value=0.0, max_value=1.0,
-            value=float(scen_data.get("values", {}).get("2100", scen_data.get("values", {}).get("2050", scen_data.get("max_adoption", 0.85)))),
-            step=0.01, format="%.2f", key="qf_end",
-        )
-
-    m_col1, m_col2, m_col3 = st.columns(3)
-    with m_col1:
-        new_max = st.number_input(
-            "Max adoption (cap)", min_value=0.0, max_value=1.0,
-            value=float(scen_data.get("max_adoption", 0.85)),
-            step=0.01, format="%.2f", key="ac_max",
-            help="Hard ceiling — the curve is capped at this fraction regardless of shape.",
-        )
-    with m_col2:
-        new_attr = st.number_input(
-            "Annual attrition", min_value=0.0, max_value=1.0,
-            value=float(scen_data.get("annual_attrition", 0.05)),
-            step=0.01, format="%.2f", key="ac_attr",
-            help="Fraction of adopted buildings that revert each year.",
-        )
-    with m_col3:
-        new_desc = st.text_input(
-            "Description", value=scen_data.get("description", ""), key="ac_desc",
-        )
-
-    # ── Live preview chart ─────────────────────────────────────────────────────
-    preview_ys = np.clip(_ac_compute_curve(qf_shape, qf_start, qf_end, len(curve_years)), 0.0, new_max)
-
-    fig = go.Figure()
-    for i, (name, s) in enumerate(scenarios.items()):
-        if name == selected:
-            continue
-        saved_ys = [float(s.get("values", {}).get(str(y), 0.0)) for y in curve_years]
+        # Live preview chart (all saved curves as context + current preview)
+        fig = go.Figure()
+        for i, (name, s) in enumerate(scenarios.items()):
+            if name == selected:
+                continue
+            saved_ys = [float(s.get("values", {}).get(str(y), 0.0)) for y in curve_years]
+            is_locked = s.get("locked", False)
+            fig.add_trace(go.Scatter(
+                x=curve_years, y=[v * 100 for v in saved_ys],
+                name=name,
+                line=dict(
+                    color=colors[i % len(colors)],
+                    width=1.5,
+                    dash="dot" if is_locked else "dash",
+                ),
+                opacity=0.35 if is_locked else 0.55,
+            ))
+        preview_ys = [float(v) for v in updated["values"].values()]
         fig.add_trace(go.Scatter(
-            x=curve_years, y=[v * 100 for v in saved_ys],
-            name=name,
-            line=dict(color=colors[i % len(colors)], width=1.5, dash="dot"),
-            opacity=0.4,
+            x=curve_years, y=[v * 100 for v in preview_ys],
+            name=f"{selected} (preview)",
+            line=dict(color="#2563eb", width=3),
         ))
-    fig.add_trace(go.Scatter(
-        x=curve_years, y=[v * 100 for v in preview_ys],
-        name=f"{selected} (preview)",
-        line=dict(color="#2563eb", width=3),
-    ))
-    fig.update_layout(
-        yaxis=dict(title="Adoption (%)", range=[0, 105]),
-        xaxis_title="Year",
-        legend_title="Scenario",
-        height=340, margin=dict(t=20, b=20),
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(
+            yaxis=dict(title="Adoption (%)", range=[0, 105]),
+            xaxis_title="Year", legend_title="Scenario",
+            height=320, margin=dict(t=20, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True, key="ac_edit_preview")
 
-    # ── Save / reset ───────────────────────────────────────────────────────────
-    save_col, reset_col, _ = st.columns([1, 1, 4], vertical_alignment="center")
-    with save_col:
-        if st.button("Save curve", type="primary", key="ac_save"):
-            scen_data["values"] = {str(y): round(float(v), 4) for y, v in zip(curve_years, preview_ys)}
-            scen_data.update({
-                "description": new_desc,
-                "max_adoption": new_max,
-                "annual_attrition": new_attr,
-                "curve_type": qf_shape.lower(),
-            })
-            raw["scenarios"][selected] = scen_data
-            _save_adoption_curves(raw)
-            st.success(f"Saved '{selected}'.")
-            st.rerun()
-    with reset_col:
-        if st.button("Reset to saved", key="ac_reset"):
-            st.rerun()
+        save_col, reset_col, _ = st.columns([1, 1, 4], vertical_alignment="center")
+        with save_col:
+            if st.button("Save", type="primary", key="ac_save"):
+                raw["scenarios"][selected] = updated
+                _save_adoption_curves(raw)
+                st.success(f"Saved '{selected}'.")
+                st.rerun()
+        with reset_col:
+            if st.button("Reset to saved", key="ac_reset"):
+                st.rerun()
+
+        st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Create new scenario
+    # ══════════════════════════════════════════════════════════════════════════
+    with st.expander("＋ Add new scenario", expanded=not bool(user_scenarios)):
+        st.caption(
+            "Define the curve parameters below, then click **Create**. "
+            "The scenario is saved immediately — no extra steps."
+        )
+        new_name = st.text_input(
+            "Scenario name", placeholder="e.g. fast_electrification",
+            key="ac_new_name",
+            help="Use letters, numbers, and underscores. Must be unique.",
+        )
+        # Sensible defaults for a new scenario
+        new_defaults = {
+            "curve_type": "sigmoid", "max_adoption": 0.85,
+            "annual_attrition": 0.02, "description": "",
+            "sigmoid_midpoint": 0.4, "sigmoid_steepness": 10.0,
+            "values": {},
+        }
+        new_params = _ac_scenario_editor("new", curve_years, new_defaults)
+        new_scen = _ac_build_scenario_dict(new_params, curve_years)
+
+        # Mini preview inside the expander
+        new_ys = [float(v) for v in new_scen["values"].values()]
+        fig_new = go.Figure(go.Scatter(
+            x=curve_years, y=[v * 100 for v in new_ys],
+            name="Preview", line=dict(color="#16a34a", width=2.5),
+        ))
+        fig_new.update_layout(
+            yaxis=dict(title="Adoption (%)", range=[0, 105]),
+            xaxis_title="Year", height=240, margin=dict(t=10, b=10),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_new, use_container_width=True, key="ac_new_preview")
+
+        if st.button("Create scenario", type="primary", key="ac_create_btn"):
+            n = new_name.strip().replace(" ", "_")
+            if not n:
+                st.error("Enter a scenario name.")
+            elif n in scenarios:
+                st.error(f"'{n}' already exists — choose a different name.")
+            else:
+                raw["scenarios"][n] = new_scen
+                _save_adoption_curves(raw)
+                st.session_state["adoption_scenario"] = n
+                st.success(f"Created '{n}'.")
+                st.rerun()
 
     st.divider()
     _ac_render_projection_period()
@@ -1135,6 +1509,12 @@ def _run_pipeline(simulated_years: list[int]) -> None:
         )
         if not st.session_state.get("is_us", True):
             _apply_non_us_priors(propensity_engine)
+        else:
+            from app.analysis.census_lookup import tract_distributions_from_enriched
+
+            td = tract_distributions_from_enriched(policy_impacts, propensity_engine.county_fips_map)
+            if td:
+                propensity_engine.tract_distributions.update(td)
         propensity_result = propensity_engine.calculate_all_probabilities()
         st.session_state["propensity_result"] = propensity_result
     except Exception as exc:
@@ -1679,6 +2059,32 @@ def _render_result_charts() -> None:
             "policy_impacts.csv", "text/csv",
             key="dl_policy",
         )
+
+    # ── Save scenario ──────────────────────────────────────────────────────────
+    st.divider()
+    st.markdown("### Save Scenario")
+    st.caption(
+        "Store this run's outputs — config, emissions trajectories, adoption summaries, and "
+        "policy impacts — to `outputs/{name}/` for later review in the **Visualize** tab."
+    )
+    save_col1, save_col2, _ = st.columns([2, 1, 3])
+    with save_col1:
+        save_name = st.text_input(
+            "Scenario name",
+            placeholder="e.g. high_incentives_2030",
+            key="save_scenario_name",
+            label_visibility="collapsed",
+        )
+    with save_col2:
+        if st.button(
+            "Save Results",
+            disabled=not save_name.strip(),
+            use_container_width=True,
+            key="btn_save_scenario",
+        ):
+            clean = save_name.strip().replace(" ", "_")
+            _save_scenario_results(clean)
+            st.success(f"Saved to `outputs/{clean}/`")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2428,6 +2834,289 @@ def _render_wip_explorer_tab() -> None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — VISUALIZE SAVED SCENARIOS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Alternate palette used for Scenario B in comparison overlay
+_SCENARIO_PALETTE_B = [
+    ("#9333ea", "rgba(147,51,234,0.20)"),
+    ("#ea580c", "rgba(234,88,12,0.20)"),
+    ("#0891b2", "rgba(8,145,178,0.20)"),
+    ("#65a30d", "rgba(101,163,13,0.20)"),
+    ("#db2777", "rgba(219,39,119,0.20)"),
+    ("#854d0e", "rgba(133,77,14,0.20)"),
+]
+
+
+def _build_adoption_fig_from_df(adoption_df: pd.DataFrame, label_prefix: str = "") -> go.Figure:
+    """Build an adoption trajectory figure from a flat saved-CSV DataFrame."""
+    fig = go.Figure()
+    if "adoption_scenario" not in adoption_df.columns:
+        return fig
+    for i, scen in enumerate(adoption_df["adoption_scenario"].unique()):
+        sub = adoption_df[adoption_df["adoption_scenario"] == scen].sort_values("year")
+        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+        name = f"{label_prefix}{scen}" if label_prefix else scen
+        years = sub["year"].tolist()
+        mean_s = sub["cumulative_adoption_pct"]
+        p10_s = sub["cumulative_adoption_pct_p10"] if "cumulative_adoption_pct_p10" in sub.columns else None
+        p90_s = sub["cumulative_adoption_pct_p90"] if "cumulative_adoption_pct_p90" in sub.columns else None
+        _add_scenario_traces(fig, years, mean_s, p10_s, p90_s, name, line_color, band_rgba)
+    fig.update_layout(
+        yaxis=dict(title="Cumulative adoption (%)", range=[0, 105]),
+        xaxis_title="Year", height=360,
+        margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.22),
+    )
+    return fig
+
+
+def _build_emissions_fig_from_df(emissions_df: pd.DataFrame, label_prefix: str = "") -> go.Figure:
+    """Build an emissions trajectory figure from a flat saved-CSV DataFrame."""
+    fig = go.Figure()
+    if emissions_df.empty or "adoption_scenario" not in emissions_df.columns:
+        return fig
+
+    # Baseline is the same across adoption scenarios — draw it once
+    first_sub = emissions_df[
+        emissions_df["adoption_scenario"] == emissions_df["adoption_scenario"].iloc[0]
+    ].sort_values("year")
+    if "baseline_emissions_t" in first_sub.columns:
+        baseline_label = f"{label_prefix}Baseline (0% adoption)" if label_prefix else "Baseline (0% adoption)"
+        fig.add_trace(go.Scatter(
+            x=first_sub["year"].tolist(),
+            y=first_sub["baseline_emissions_t"].tolist(),
+            mode="lines", name=baseline_label,
+            line=dict(color="#dc2626", width=2.5, dash="dot"),
+        ))
+
+    for i, scen in enumerate(emissions_df["adoption_scenario"].unique()):
+        sub = emissions_df[emissions_df["adoption_scenario"] == scen].sort_values("year")
+        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+        name = f"{label_prefix}{scen}" if label_prefix else scen
+        yrs = sub["year"].tolist()
+        mean_vals = sub["scenario_mean_t"].tolist()
+        lo_vals = sub["scenario_p10_t"].tolist() if "scenario_p10_t" in sub.columns else [v * 0.90 for v in mean_vals]
+        hi_vals = sub["scenario_p90_t"].tolist() if "scenario_p90_t" in sub.columns else [v * 1.10 for v in mean_vals]
+        fig.add_trace(go.Scatter(x=yrs, y=lo_vals, mode="lines",
+                                 line=dict(color="rgba(0,0,0,0)"),
+                                 showlegend=False, hoverinfo="skip", legendgroup=name))
+        fig.add_trace(go.Scatter(x=yrs, y=hi_vals, mode="lines",
+                                 line=dict(color="rgba(0,0,0,0)"),
+                                 fill="tonexty", fillcolor=band_rgba,
+                                 showlegend=False, hoverinfo="skip", legendgroup=name))
+        fig.add_trace(go.Scatter(x=yrs, y=mean_vals, mode="lines", name=name,
+                                 line=dict(color=line_color, width=2.5), legendgroup=name))
+    fig.update_layout(
+        yaxis_title="tCO₂/yr", xaxis_title="Year", height=360,
+        margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.22),
+    )
+    return fig
+
+
+def _render_scenario_kpis(data: dict, label: str) -> None:
+    """Display summary KPI metrics for a saved scenario."""
+    meta = data.get("metadata", {})
+    cols = st.columns(4)
+    cols[0].metric("Scenario", label)
+    n_bldg = meta.get("n_buildings")
+    cols[1].metric("Buildings", f"{n_bldg:,}" if n_bldg else "—")
+    mean_acc = meta.get("mean_acceptance_probability")
+    cols[2].metric("Mean acceptance prob.", f"{mean_acc:.1%}" if mean_acc is not None else "—")
+    saved_at = meta.get("saved_at", "—")
+    cols[3].metric("Saved", saved_at[:10] if saved_at != "—" else "—")
+
+
+def _render_visualize_tab() -> None:
+    st.markdown("## Visualize Saved Scenarios")
+    st.caption(
+        "Select a previously saved scenario to review its results, "
+        "or compare two scenarios side by side."
+    )
+
+    saved = _list_saved_scenarios()
+    if not saved:
+        st.info(
+            "No saved scenarios yet. Run an analysis in **5 · Run & Results** "
+            "and click **Save Results** to store outputs here."
+        )
+        return
+
+    view_mode = st.radio(
+        "View mode",
+        ["Single scenario", "Side-by-side comparison"],
+        horizontal=True,
+        key="viz_mode",
+    )
+
+    # ── Single scenario ────────────────────────────────────────────────────────
+    if view_mode == "Single scenario":
+        selected = st.selectbox("Select scenario", saved, key="viz_single_select")
+        if not selected:
+            return
+        data = _load_scenario_data(selected)
+        if not data:
+            st.error("Could not load scenario data.")
+            return
+
+        _render_scenario_kpis(data, selected)
+        st.divider()
+
+        adoption_df = data.get("adoption")
+        emissions_df = data.get("emissions")
+
+        if adoption_df is not None and not adoption_df.empty:
+            st.markdown("### Adoption Trajectories")
+            st.plotly_chart(
+                _build_adoption_fig_from_df(adoption_df),
+                use_container_width=True, key="viz_adoption",
+            )
+
+        if emissions_df is not None and not emissions_df.empty:
+            st.divider()
+            st.markdown("### Emissions Trajectories (tCO₂/yr)")
+            st.plotly_chart(
+                _build_emissions_fig_from_df(emissions_df),
+                use_container_width=True, key="viz_emissions",
+            )
+
+        policy_df = data.get("policy_impacts")
+        if policy_df is not None and not policy_df.empty:
+            st.divider()
+            st.markdown("### Policy Impacts (per building)")
+            st.dataframe(policy_df.head(500), use_container_width=True)
+
+    # ── Side-by-side comparison ────────────────────────────────────────────────
+    else:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            sel_a = st.selectbox("Scenario A", saved, key="viz_compare_a")
+        with col_b:
+            sel_b = st.selectbox(
+                "Scenario B",
+                saved,
+                index=min(1, len(saved) - 1),
+                key="viz_compare_b",
+            )
+
+        if not sel_a or not sel_b:
+            return
+
+        data_a = _load_scenario_data(sel_a)
+        data_b = _load_scenario_data(sel_b)
+        if not data_a or not data_b:
+            st.error("Could not load one or both scenarios.")
+            return
+
+        # Metadata rows
+        st.divider()
+        mc_a, mc_b = st.columns(2)
+        with mc_a:
+            st.markdown(f"**{sel_a}**")
+            _render_scenario_kpis(data_a, sel_a)
+        with mc_b:
+            st.markdown(f"**{sel_b}**")
+            _render_scenario_kpis(data_b, sel_b)
+
+        # Adoption side by side
+        adop_a = data_a.get("adoption")
+        adop_b = data_b.get("adoption")
+        if adop_a is not None and adop_b is not None:
+            st.divider()
+            st.markdown("### Adoption Trajectories")
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                st.caption(sel_a)
+                st.plotly_chart(
+                    _build_adoption_fig_from_df(adop_a),
+                    use_container_width=True, key="viz_cmp_adopt_a",
+                )
+            with ac2:
+                st.caption(sel_b)
+                st.plotly_chart(
+                    _build_adoption_fig_from_df(adop_b),
+                    use_container_width=True, key="viz_cmp_adopt_b",
+                )
+
+        # Emissions side by side
+        em_a = data_a.get("emissions")
+        em_b = data_b.get("emissions")
+        if em_a is not None and em_b is not None:
+            st.divider()
+            st.markdown("### Emissions Trajectories (tCO₂/yr)")
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                st.caption(sel_a)
+                st.plotly_chart(
+                    _build_emissions_fig_from_df(em_a),
+                    use_container_width=True, key="viz_cmp_em_a",
+                )
+            with ec2:
+                st.caption(sel_b)
+                st.plotly_chart(
+                    _build_emissions_fig_from_df(em_b),
+                    use_container_width=True, key="viz_cmp_em_b",
+                )
+
+            # Overlay both scenarios on a single chart
+            st.divider()
+            st.markdown("### Overlay Comparison — Emissions")
+            st.caption(
+                f"Both scenarios overlaid for direct comparison. "
+                f"Solid lines = **{sel_a}**, dashed lines = **{sel_b}**."
+            )
+            fig_ov = go.Figure()
+
+            first_sub_a = em_a[em_a["adoption_scenario"] == em_a["adoption_scenario"].iloc[0]].sort_values("year")
+            if "baseline_emissions_t" in first_sub_a.columns:
+                fig_ov.add_trace(go.Scatter(
+                    x=first_sub_a["year"].tolist(),
+                    y=first_sub_a["baseline_emissions_t"].tolist(),
+                    mode="lines", name="Baseline",
+                    line=dict(color="#dc2626", width=2.5, dash="dot"),
+                ))
+
+            for i, scen in enumerate(em_a["adoption_scenario"].unique()):
+                sub = em_a[em_a["adoption_scenario"] == scen].sort_values("year")
+                lc, br = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+                name = f"{sel_a} · {scen}"
+                yrs = sub["year"].tolist()
+                mean_vals = sub["scenario_mean_t"].tolist()
+                lo_v = sub["scenario_p10_t"].tolist() if "scenario_p10_t" in sub.columns else [v * 0.90 for v in mean_vals]
+                hi_v = sub["scenario_p90_t"].tolist() if "scenario_p90_t" in sub.columns else [v * 1.10 for v in mean_vals]
+                fig_ov.add_trace(go.Scatter(x=yrs, y=lo_v, mode="lines",
+                                            line=dict(color="rgba(0,0,0,0)"), showlegend=False,
+                                            hoverinfo="skip", legendgroup=name))
+                fig_ov.add_trace(go.Scatter(x=yrs, y=hi_v, mode="lines",
+                                            line=dict(color="rgba(0,0,0,0)"), fill="tonexty",
+                                            fillcolor=br, showlegend=False, hoverinfo="skip", legendgroup=name))
+                fig_ov.add_trace(go.Scatter(x=yrs, y=mean_vals, mode="lines", name=name,
+                                            line=dict(color=lc, width=2.5), legendgroup=name))
+
+            for i, scen in enumerate(em_b["adoption_scenario"].unique()):
+                sub = em_b[em_b["adoption_scenario"] == scen].sort_values("year")
+                lc, br = _SCENARIO_PALETTE_B[i % len(_SCENARIO_PALETTE_B)]
+                name = f"{sel_b} · {scen}"
+                yrs = sub["year"].tolist()
+                mean_vals = sub["scenario_mean_t"].tolist()
+                lo_v = sub["scenario_p10_t"].tolist() if "scenario_p10_t" in sub.columns else [v * 0.90 for v in mean_vals]
+                hi_v = sub["scenario_p90_t"].tolist() if "scenario_p90_t" in sub.columns else [v * 1.10 for v in mean_vals]
+                fig_ov.add_trace(go.Scatter(x=yrs, y=lo_v, mode="lines",
+                                            line=dict(color="rgba(0,0,0,0)"), showlegend=False,
+                                            hoverinfo="skip", legendgroup=name))
+                fig_ov.add_trace(go.Scatter(x=yrs, y=hi_v, mode="lines",
+                                            line=dict(color="rgba(0,0,0,0)"), fill="tonexty",
+                                            fillcolor=br, showlegend=False, hoverinfo="skip", legendgroup=name))
+                fig_ov.add_trace(go.Scatter(x=yrs, y=mean_vals, mode="lines", name=name,
+                                            line=dict(color=lc, width=2.5, dash="dash"), legendgroup=name))
+
+            fig_ov.update_layout(
+                yaxis_title="tCO₂/yr", xaxis_title="Year", height=420,
+                margin=dict(t=20, b=20), legend=dict(orientation="h", y=-0.25),
+            )
+            st.plotly_chart(fig_ov, use_container_width=True, key="viz_overlay_em")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -2440,12 +3129,13 @@ def main() -> None:
         "energy simulation output from [globi](https://github.com/globi)."
     )
 
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "1 · Upload Data",
         "2 · Configure",
         "3 · Adoption Curves",
         "4 · Emissions",
         "5 · Run & Results",
+        "Visualize",
         "WIP Explorer",
     ])
 
@@ -2460,6 +3150,8 @@ def main() -> None:
     with tab5:
         _render_results_tab()
     with tab6:
+        _render_visualize_tab()
+    with tab7:
         _render_wip_explorer_tab()
 
 

@@ -42,12 +42,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 import yaml
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +121,7 @@ class PropensityResult(BaseModel):
     mean_acceptance_probability: float
 
 
-class PropensityModelEngine:
+class PropensityModelEngine(BaseModel):
     """Engine for calculating retrofit deal acceptance probabilities.
 
     Args:
@@ -149,49 +149,68 @@ class PropensityModelEngine:
         energy_price_growth_rate: Annual energy price growth for commercial NPV.
     """
 
-    def __init__(  # noqa: D107
-        self,
-        policy_impacts_path: str | Path | None = None,
-        census_data_path: str | Path | None = None,
-        climate_opinions_path: str | Path | None = None,
-        enhanced_building_data_path: str | Path | None = None,
-        params_path: str | Path | None = None,
-        policy_impacts_df: pd.DataFrame | None = None,
-        # Geography / model overrides
-        model_coefficients: dict[str, float] | None = None,
-        default_county_concern: dict[str, float] | None = None,
-        county_fips_map: dict[int, str] | None = None,
-        # Behaviour parameters
-        neighbor_effect: float | None = None,
-        random_seed: int | None = None,
-        n_monte_carlo_samples: int | None = None,
-        incentive_by_income: dict[float, float] | None = None,
-        # Commercial model parameters
-        npv_years: int | None = None,
-        wacc: float | None = None,
-        npv_threshold_usd: float | None = None,
-        energy_price_growth_rate: float | None = None,
-        # Legacy aliases
-        equipment_lifetime_years: int | None = None,
-        discount_rate: float | None = None,
-    ):
-        self.params: dict = {}
-        if params_path is not None:
-            p = Path(params_path)
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    # Input paths
+    policy_impacts_path: Path | None = None
+    census_data_path: Path | None = None
+    climate_opinions_path: Path | None = None
+    enhanced_building_data_path: Path | None = None
+    params_path: Path | None = None
+
+    # Pre-loaded data alternative to path
+    policy_impacts_df: pd.DataFrame | None = None
+
+    # Geography / model overrides
+    model_coefficients: dict[str, float] | None = None
+    default_county_concern: dict[str, float] | None = None
+    county_fips_map: dict[int, str] | None = None
+
+    # Behaviour parameters
+    neighbor_effect: float | None = None
+    random_seed: int | None = None
+    n_monte_carlo_samples: int | None = None
+    incentive_by_income: dict[float, float] | None = None
+
+    # Commercial model parameters
+    npv_years: int | None = None
+    wacc: float | None = None
+    npv_threshold_usd: float | None = None
+    energy_price_growth_rate: float | None = None
+
+    # Legacy aliases
+    equipment_lifetime_years: int | None = None
+    discount_rate: float | None = None
+
+    # Computed fields (set in model_post_init)
+    params: dict[str, Any] = Field(default_factory=dict)
+    data: pd.DataFrame | None = None
+    census_data: pd.DataFrame | None = None
+    county_concern: dict[str, float] = Field(default_factory=dict)
+    enhanced_building_data: pd.DataFrame | None = None
+    compute_cohort_acceptance: bool = True
+    cohort_income_levels_k_usd: dict[str, float] = Field(default_factory=dict)
+    rng: Any = None
+    tract_distributions: dict[str, dict] = Field(default_factory=dict)
+
+    def model_post_init(self, __context: Any) -> None:
+        self.params = {}
+        if self.params_path is not None:
+            p = Path(self.params_path)
             if p.exists():
                 with open(p) as f:
                     self.params = yaml.safe_load(f) or {}
             else:
-                logger.warning(f"Params file not found: {params_path}")
+                logger.warning(f"Params file not found: {self.params_path}")
 
         prop_cfg = self.params.get("propensity", {})
         comm_cfg = self.params.get("commercial_propensity", {})
 
         # Load data
-        if policy_impacts_df is not None:
-            self.data = policy_impacts_df.copy()
-        elif policy_impacts_path is not None:
-            self.data = pd.read_parquet(policy_impacts_path)
+        if self.policy_impacts_df is not None:
+            self.data = self.policy_impacts_df.copy()
+        elif self.policy_impacts_path is not None:
+            self.data = pd.read_parquet(self.policy_impacts_path)
         else:
             msg = "Must provide policy_impacts_path or policy_impacts_df"
             raise ValueError(msg)
@@ -210,33 +229,29 @@ class PropensityModelEngine:
                     logger.info(f"Filtered to tract_ids: {len(self.data)} rows (was {before})")
                     break
 
-        # Model coefficients / concern — use overrides or defaults
-        self.model_coefficients: dict[str, float] = model_coefficients or _DEFAULT_MODEL_COEFFICIENTS
-        self._default_concern: dict[str, float] = default_county_concern or _DEFAULT_COUNTY_CONCERN
-        self._county_fips_map: dict[int, str] = county_fips_map or _DEFAULT_COUNTY_FIPS_MAP
+        # Resolve model coefficients / concern maps — use overrides or defaults
+        self.model_coefficients = self.model_coefficients or _DEFAULT_MODEL_COEFFICIENTS
+        self.default_county_concern = self.default_county_concern or _DEFAULT_COUNTY_CONCERN
+        self.county_fips_map = self.county_fips_map or _DEFAULT_COUNTY_FIPS_MAP
 
         # Census / climate data
-        self.census_data_path = Path(census_data_path) if census_data_path else None
         self.census_data = self._load_census_data()
-        self.climate_opinions_path = Path(climate_opinions_path) if climate_opinions_path else None
         self.county_concern = self._load_climate_opinions()
-        self.enhanced_building_data_path = Path(enhanced_building_data_path) if enhanced_building_data_path else None
         self.enhanced_building_data = self._load_enhanced_building_data()
 
-        # Behaviour parameters
-        self.neighbor_effect = neighbor_effect if neighbor_effect is not None else prop_cfg.get("neighbor_effect", 3.0)
-        self.random_seed = random_seed if random_seed is not None else prop_cfg.get("random_seed", 42)
+        # Resolve behaviour parameters
+        self.neighbor_effect = self.neighbor_effect if self.neighbor_effect is not None else prop_cfg.get("neighbor_effect", 3.0)
+        self.random_seed = self.random_seed if self.random_seed is not None else prop_cfg.get("random_seed", 42)
         self.rng = np.random.default_rng(self.random_seed)
-        self.n_monte_carlo_samples = n_monte_carlo_samples if n_monte_carlo_samples is not None else prop_cfg.get("n_monte_carlo_samples", 100)
-        self.incentive_by_income: dict[float, float] | None = incentive_by_income
+        self.n_monte_carlo_samples = self.n_monte_carlo_samples if self.n_monte_carlo_samples is not None else prop_cfg.get("n_monte_carlo_samples", 100)
         self.compute_cohort_acceptance = bool(prop_cfg.get("compute_cohort_acceptance", True))
         self.cohort_income_levels_k_usd = _merge_cohort_income_levels(prop_cfg)
 
-        # Commercial parameters
-        self.npv_years = npv_years if npv_years is not None else (equipment_lifetime_years if equipment_lifetime_years is not None else comm_cfg.get("npv_years") or comm_cfg.get("equipment_lifetime_years", 15))
-        self.wacc = wacc if wacc is not None else (discount_rate if discount_rate is not None else comm_cfg.get("wacc") or comm_cfg.get("discount_rate", 0.07))
-        self.npv_threshold_usd = npv_threshold_usd if npv_threshold_usd is not None else comm_cfg.get("npv_threshold_usd", 0.0)
-        self.energy_price_growth_rate = energy_price_growth_rate if energy_price_growth_rate is not None else comm_cfg.get("energy_price_growth_rate", 0.02)
+        # Resolve commercial parameters
+        self.npv_years = self.npv_years if self.npv_years is not None else (self.equipment_lifetime_years if self.equipment_lifetime_years is not None else comm_cfg.get("npv_years") or comm_cfg.get("equipment_lifetime_years", 15))
+        self.wacc = self.wacc if self.wacc is not None else (self.discount_rate if self.discount_rate is not None else comm_cfg.get("wacc") or comm_cfg.get("discount_rate", 0.07))
+        self.npv_threshold_usd = self.npv_threshold_usd if self.npv_threshold_usd is not None else comm_cfg.get("npv_threshold_usd", 0.0)
+        self.energy_price_growth_rate = self.energy_price_growth_rate if self.energy_price_growth_rate is not None else comm_cfg.get("energy_price_growth_rate", 0.02)
 
         self._precompute_tract_distributions()
         self._classify_buildings()
@@ -258,7 +273,7 @@ class PropensityModelEngine:
 
         def _lookup_county(code: object) -> str | None:
             key = _to_int(code)
-            return self._county_fips_map.get(key) if key is not None else None
+            return self.county_fips_map.get(key) if key is not None else None
 
         df["county_name"] = df["county"].apply(_lookup_county)
         df["tract_str"] = df["tract"].astype(str).str.split(".").str[0].str.strip().str.zfill(6)
@@ -291,7 +306,7 @@ class PropensityModelEngine:
                     return result
             except Exception as e:
                 logger.warning(f"Error loading climate opinions: {e}")
-        return dict(self._default_concern)
+        return dict(self.default_county_concern)
 
     # ── Census tract distributions ────────────────────────────────────────────
 
@@ -324,7 +339,23 @@ class PropensityModelEngine:
             }
         logger.info(f"Precomputed distributions for {len(self.tract_distributions)} tracts")
 
-    def _sample_demographics(self, county: str, tract_id: str | None = None, n_samples: int = 1) -> dict[str, np.ndarray]:
+    def _sample_demographics(
+        self,
+        county: str,
+        tract_id: str | None = None,
+        n_samples: int = 1,
+        geoid: str | None = None,
+    ) -> dict[str, np.ndarray]:
+        if geoid:
+            g = str(geoid).strip()
+            if g in self.tract_distributions:
+                dist = self.tract_distributions[g]
+                return {
+                    "education": self.rng.choice(EDUCATION_CATEGORIES, size=n_samples, p=dist["education"]),
+                    "household_size": self.rng.choice(HOUSEHOLD_SIZE_CATEGORIES, size=n_samples, p=dist["household_size"]),
+                    "income": self.rng.choice(INCOME_CATEGORIES, size=n_samples, p=dist["income"]),
+                }
+
         tract_key = None
         if tract_id is not None:
             tid = str(tract_id).strip()
@@ -452,8 +483,12 @@ class PropensityModelEngine:
         county_col = next((c for c in ["building.county", "feature.location.county", "county", "county_fips"] if c in sub.columns), None)
         counties = sub[county_col].fillna("Middlesex").astype(str) if county_col else pd.Series(["Middlesex"] * n, index=sub.index)
 
-        tract_col = next((c for c in ["building.tract_id", "feature.location.tract_id", "tract_id", "GEOID20", "GEOID"] if c in sub.columns), None)
+        tract_col = next(
+            (c for c in ["building.tract_id", "feature.location.tract_id", "tract_id", "GEOID20", "GEOID"] if c in sub.columns),
+            None,
+        )
         tract_ids = sub[tract_col] if tract_col else pd.Series([None] * n, index=sub.index)
+        geoid_col = "geoid" if "geoid" in sub.columns else None
 
         if "feature.semantic.Age_bracket" in sub.columns:
             building_age = sub["feature.semantic.Age_bracket"].map(age_map).fillna(40).values.astype(float)
@@ -476,6 +511,9 @@ class PropensityModelEngine:
 
         county_vals = counties.values
         tract_vals = np.where(tract_ids.fillna("").astype(str).values == "nan", "", tract_ids.fillna("").astype(str).values)
+        geoid_vals = None
+        if geoid_col:
+            geoid_vals = sub[geoid_col].astype(object).values
 
         propensity_min = np.empty(n)
         propensity_max = np.empty(n)
@@ -485,17 +523,31 @@ class PropensityModelEngine:
         cohort_mod = np.full(n, np.nan)
         cohort_non = np.full(n, np.nan)
 
-        # Group by (county, tract) for vectorised batch sampling
-        group_indices: dict[tuple[str, str], list[int]] = {}
+        # group by geoid when present and non-empty, else (county, tract)
+        group_indices: dict[tuple, list[int]] = {}
         for i, (county, tract) in enumerate(zip(county_vals, tract_vals, strict=False)):
-            k = (str(county), str(tract))
+            gid = ""
+            if geoid_vals is not None:
+                gv = geoid_vals[i]
+                if gv is not None and not pd.isna(gv) and str(gv).strip():
+                    gid = str(gv).strip()
+            if gid:
+                k = ("geoid", gid)
+            else:
+                k = ("tract", str(county), str(tract))
             group_indices.setdefault(k, []).append(i)
 
-        for (county, tract_str), indices in group_indices.items():
+        for gkey, indices in group_indices.items():
             idx = np.array(indices)
             m = len(idx)
-            demo = self._sample_demographics(county, tract_id=tract_str or None, n_samples=m * n_samples)
-            concern = self.county_concern.get(county, 3.5)
+            if gkey[0] == "geoid":
+                demo = self._sample_demographics("", tract_id=None, n_samples=m * n_samples, geoid=gkey[1])
+                cname = (self.tract_distributions.get(gkey[1]) or {}).get("county") or ""
+            else:
+                _, county, tract_str = gkey
+                demo = self._sample_demographics(county, tract_id=tract_str or None, n_samples=m * n_samples)
+                cname = county
+            concern = self.county_concern.get(cname, 3.5)
 
             edu = demo["education"].reshape(m, n_samples)
             hh = demo["household_size"].reshape(m, n_samples)

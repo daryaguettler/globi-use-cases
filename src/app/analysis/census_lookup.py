@@ -87,17 +87,23 @@ def batch_geocode(
     lat_col: str = "lat",
     lon_col: str = "lon",
     max_buildings: int = 500,
-    sleep_between: float = 0.05,
+    sleep_between: float = 0.03,
+    coord_round_decimals: int = 5,
 ) -> pd.DataFrame:
-    """Geocode a DataFrame of buildings, adding ``state``, ``county_fips``,
+    """Geocode a DataFrame of buildings, adding ``state_fips``, ``county_fips``,
     ``tract_fips``, and ``geoid`` columns.
+
+    One Census Geocoder request is made per *distinct* rounded (lat, lon) among
+    the first ``max_buildings`` rows — buildings that share the same coordinates
+    reuse the same result (typical for portfolios in one tract).
 
     Args:
         df:             DataFrame with lat/lon columns.
         lat_col:        Name of latitude column.
         lon_col:        Name of longitude column.
-        max_buildings:  Cap on number of buildings to geocode (for performance).
-        sleep_between:  Seconds to sleep between API calls.
+        max_buildings:  Cap on number of buildings considered (for performance).
+        sleep_between:  Seconds to sleep between distinct geocoder calls.
+        coord_round_decimals: Decimal places for deduplicating coordinates (~1.1 m at 5).
 
     Returns:
         DataFrame with census columns added (NaN where lookup failed).
@@ -114,6 +120,8 @@ def batch_geocode(
     if rows_to_process < len(df):
         logger.info(f"Geocoding capped at {max_buildings} buildings.")
 
+    # group row indices by rounded coordinate → one API call per distinct location
+    buckets: dict[tuple[float, float], list[Any]] = {}
     for i in range(rows_to_process):
         lat = df[lat_col].iloc[i]
         lon = df[lon_col].iloc[i]
@@ -121,14 +129,20 @@ def batch_geocode(
             lat_f, lon_f = float(lat), float(lon)
         except (TypeError, ValueError):
             continue
+        key = (round(lat_f, coord_round_decimals), round(lon_f, coord_round_decimals))
+        buckets.setdefault(key, []).append(df.index[i])
 
+    n_unique = len(buckets)
+    logger.info(f"Geocoding {n_unique} distinct coordinate(s) for {rows_to_process} row(s).")
+
+    for (lat_f, lon_f), idx_list in buckets.items():
         result = geocode_point(lat_f, lon_f)
-        if result:
-            out.at[df.index[i], "state_fips"] = result["state"]
-            out.at[df.index[i], "county_fips"] = result["county"]
-            out.at[df.index[i], "tract_fips"] = result["tract"]
-            out.at[df.index[i], "geoid"] = result["geoid"]
-
+        if result and (result.geoid or result.state):
+            for idx in idx_list:
+                out.at[idx, "state_fips"] = result.state
+                out.at[idx, "county_fips"] = result.county
+                out.at[idx, "tract_fips"] = result.tract
+                out.at[idx, "geoid"] = result.geoid
         if sleep_between > 0:
             time.sleep(sleep_between)
 
@@ -168,6 +182,16 @@ _ACS_EDU_VARS = [
     "B15003_024E",  # Professional
     "B15003_025E",  # Doctorate
 ]
+# household size (matches propensity engine: 1–7 person categories)
+_ACS_HH_VARS = [
+    "B11016_002E",
+    "B11016_003E",
+    "B11016_004E",
+    "B11016_005E",
+    "B11016_006E",
+    "B11016_007E",
+    "B11016_008E",
+]
 
 
 def fetch_tract_demographics(
@@ -176,12 +200,12 @@ def fetch_tract_demographics(
     tract_fips: str,
     api_key: str | None = None,
 ) -> dict[str, Any] | None:
-    """Fetch ACS5 income and education distributions for a census tract.
+    """Fetch ACS5 income, education, and household-size distributions for a tract.
 
-    Returns a dict with keys ``income_probs`` and ``education_probs``
-    (normalised probability arrays), or ``None`` on failure.
+    Returns a dict with ``income_probs``, ``education_probs``, ``household_probs``
+    (normalised lists), or ``None`` on failure.
     """
-    variables = ",".join(_ACS_INCOME_VARS + _ACS_EDU_VARS)
+    variables = ",".join(_ACS_INCOME_VARS + _ACS_EDU_VARS + _ACS_HH_VARS)
     params: dict[str, str] = {
         "get": variables,
         "for": f"tract:{tract_fips}",
@@ -215,6 +239,10 @@ def fetch_tract_demographics(
             edu_raw[5],                                           # Bachelors
             edu_raw[6] + edu_raw[7] + edu_raw[8],                # Graduate
         ], dtype=float)
+        hh_counts = np.array(
+            [max(0, int(data.get(v, 0) or 0)) for v in _ACS_HH_VARS],
+            dtype=float,
+        )
 
         def _normalise(arr: np.ndarray) -> np.ndarray:
             s = arr.sum()
@@ -223,6 +251,7 @@ def fetch_tract_demographics(
         return {
             "income_probs": _normalise(income_counts).tolist(),
             "education_probs": _normalise(edu_counts).tolist(),
+            "household_probs": _normalise(hh_counts).tolist(),
         }
     except Exception as exc:
         logger.debug(f"ACS fetch failed for {state_fips}/{county_fips}/{tract_fips}: {exc}")
@@ -239,13 +268,13 @@ def enrich_with_census(
     """Geocode buildings and fetch ACS demographics, returning an enriched DataFrame.
 
     Adds columns: ``state_fips``, ``county_fips``, ``tract_fips``, ``geoid``,
-    ``income_probs`` (list), ``education_probs`` (list).
+    ``income_probs``, ``education_probs``, ``household_probs`` (lists per row).
     """
     out = batch_geocode(df, lat_col=lat_col, lon_col=lon_col, max_buildings=max_buildings)
 
-    # Fetch demographics per unique tract
+    # fetch demographics per unique tract (not per row)
     tract_cache: dict[tuple, dict | None] = {}
-    for col in ["income_probs", "education_probs"]:
+    for col in ["income_probs", "education_probs", "household_probs"]:
         out[col] = None
 
     for idx in out.index:
@@ -257,12 +286,72 @@ def enrich_with_census(
         key = (state, county, tract)
         if key not in tract_cache:
             tract_cache[key] = fetch_tract_demographics(state, county, tract, api_key)
-            time.sleep(0.1)
+            time.sleep(0.08)
         demo = tract_cache[key]
         if demo:
             out.at[idx, "income_probs"] = demo["income_probs"]
             out.at[idx, "education_probs"] = demo["education_probs"]
+            hp = demo.get("household_probs")
+            out.at[idx, "household_probs"] = hp if hp is not None else [1.0 / 7.0] * 7
 
+    return out
+
+
+def tract_distributions_from_enriched(
+    df: pd.DataFrame,
+    county_fips_map: dict[int, str] | None = None,
+) -> dict[str, dict]:
+    """Build ``PropensityModelEngine.tract_distributions`` entries keyed by ``geoid``.
+
+    Uses columns produced by :func:`enrich_with_census`. County names are resolved
+    via ``county_fips_map`` when possible (defaults to MA in the app engine).
+    """
+    county_fips_map = county_fips_map or {}
+    required = ("geoid", "income_probs", "education_probs")
+    if not all(c in df.columns for c in required):
+        return {}
+    sub = df[df["geoid"].notna()].copy()
+    if sub.empty:
+        return {}
+    sub = sub.drop_duplicates(subset=["geoid"], keep="first")
+    out: dict[str, dict[str, Any]] = {}
+    for _, row in sub.iterrows():
+        gid = str(row["geoid"]).strip()
+        if not gid:
+            continue
+        inc = row.get("income_probs")
+        edu = row.get("education_probs")
+        if inc is None or edu is None:
+            continue
+        cfi = row.get("county_fips")
+        county_name = ""
+        if cfi is not None and pd.notna(cfi):
+            try:
+                ck = int(float(str(cfi).split(".")[0]))
+                county_name = county_fips_map.get(ck) or ""
+            except (TypeError, ValueError):
+                county_name = ""
+        if not county_name and cfi is not None and pd.notna(cfi):
+            county_name = str(cfi).strip()
+
+        hhp = row.get("household_probs")
+        if hhp is None or (isinstance(hhp, float) and pd.isna(hhp)):
+            hh = np.ones(7, dtype=float) / 7.0
+        else:
+            hh = np.array(list(hhp), dtype=float)
+            hh = hh / hh.sum() if hh.sum() > 0 else np.ones(7, dtype=float) / 7.0
+
+        inc_a = np.array(list(inc), dtype=float)
+        edu_a = np.array(list(edu), dtype=float)
+        inc_a = inc_a / inc_a.sum() if inc_a.sum() > 0 else np.ones_like(inc_a) / len(inc_a)
+        edu_a = edu_a / edu_a.sum() if edu_a.sum() > 0 else np.ones_like(edu_a) / len(edu_a)
+
+        out[gid] = {
+            "education": edu_a,
+            "household_size": hh,
+            "income": inc_a,
+            "county": county_name or "Unknown",
+        }
     return out
 
 
