@@ -1,5 +1,5 @@
 # host port (docker-compose.st.yml)
-PORT=8501
+PORT=8502
 
 # visualizer image name (ecr-style default in compose; override with env when pushing)
 # AWS_ACCOUNT_ID=123456789012

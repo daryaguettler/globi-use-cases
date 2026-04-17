@@ -26,8 +26,8 @@ COPY .streamlit/config.toml /code/.streamlit/config.toml
 
 RUN uv sync --frozen
 
-EXPOSE 8501
+EXPOSE 8502
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:8502/_stcore/health || exit 1
 
 CMD ["uv", "run", "streamlit", "run", "src/app/wtp_app.py"]

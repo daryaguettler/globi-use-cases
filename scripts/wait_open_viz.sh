@@ -9,7 +9,7 @@ compose=(docker compose -f docker-compose.yml -f docker-compose.st.yml)
 
 url=""
 for _ in $(seq 1 60); do
-  hp=$("${compose[@]}" port visualizer 8501 2>/dev/null | sed 's/^.*://' || true)
+  hp=$("${compose[@]}" port visualizer 8502 2>/dev/null | sed 's/^.*://' || true)
   if [[ -n "${hp}" ]] && curl -sf "http://127.0.0.1:${hp}/_stcore/health" >/dev/null 2>&1; then
     url="http://localhost:${hp}/"
     break

@@ -33,13 +33,13 @@ editor:
 	PYTHONPATH=src uv run streamlit run src/tools/viz/wip/interface.py
 
 IMAGE_NAME ?= globi-use-cases
-PORT       ?= 8501
+PORT       ?= 8502
 
 docker-build:
 	docker build -f docker/visualizer/Dockerfile -t $(IMAGE_NAME) .
 
 docker-run:
-	docker run --rm -p $(PORT):8501 $(IMAGE_NAME)
+	docker run --rm -p $(PORT):8502 $(IMAGE_NAME)
 
 docker-stop:
 	docker ps -q --filter ancestor=$(IMAGE_NAME) | xargs -r docker stop
