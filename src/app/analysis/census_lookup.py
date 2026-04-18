@@ -1,17 +1,24 @@
 """Look up US census tract demographics for buildings using lat/lon coordinates.
 
 Uses the free Census Geocoder API (no key required) to resolve lat/lon → tract,
-then the Census ACS5 API (free key, optional) to fetch income and education
-distributions.
+then the Census ACS5 API (free key, optional) to fetch income, education, and
+household distributions.
 
-For non-US data, ``build_prior_from_sliders`` converts user-specified
+Successful geocoder and ACS responses are persisted under ``outputs/census_cache/``
+(JSON) so repeat runs for the same coordinates or tracts skip network calls.
+Override the directory with env ``GLOBI_CENSUS_CACHE_DIR``.
+
+For non-US data, ``build_prior_distributions`` converts user-specified
 distribution parameters into the format expected by PropensityModelEngine.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -20,6 +27,98 @@ import requests
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+_CACHE_VERSION = 1
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent.parent
+
+
+def census_cache_dir() -> Path:
+    """Directory for persisted geocoder + ACS responses (``outputs/census_cache``)."""
+    override = os.environ.get("GLOBI_CENSUS_CACHE_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _repo_root() / "outputs" / "census_cache"
+
+
+def _geocode_cache_path() -> Path:
+    return census_cache_dir() / "geocode_cache.json"
+
+
+def _tract_acs_cache_path() -> Path:
+    return census_cache_dir() / "tract_acs_cache.json"
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read census cache %s: %s", path, exc)
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return raw
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _coord_cache_key(lat_f: float, lon_f: float, decimals: int) -> str:
+    return f"{round(lat_f, decimals):.{decimals}f},{round(lon_f, decimals):.{decimals}f}"
+
+
+def _tract_cache_key(state: str, county: str, tract: str) -> str:
+    s = str(state).strip().zfill(2)
+    c = str(county).strip().split(".")[0].zfill(3)
+    t = str(tract).strip().split(".")[0].zfill(6)
+    return f"{s}|{c}|{t}"
+
+
+def _load_geocode_disk_cache() -> dict[str, dict[str, str]]:
+    data = _read_json_object(_geocode_cache_path())
+    v = data.get("_version", 0)
+    entries = data.get("entries") if v == _CACHE_VERSION else None
+    if not isinstance(entries, dict):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    for k, entry in entries.items():
+        if isinstance(k, str) and isinstance(entry, dict) and all(x in entry for x in ("state", "county", "tract", "geoid")):
+            out[k] = {kk: str(entry[kk]) for kk in ("state", "county", "tract", "geoid")}
+    return out
+
+
+def _save_geocode_disk_cache(entries: dict[str, dict[str, str]]) -> None:
+    payload = {"_version": _CACHE_VERSION, "entries": dict(sorted(entries.items()))}
+    _atomic_write_json(_geocode_cache_path(), payload)
+
+
+def _load_tract_acs_disk_cache() -> dict[str, dict[str, Any]]:
+    data = _read_json_object(_tract_acs_cache_path())
+    v = data.get("_version", 0)
+    entries = data.get("entries") if v == _CACHE_VERSION else None
+    if not isinstance(entries, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for k, v in entries.items():
+        if not isinstance(k, str) or not isinstance(v, dict):
+            continue
+        if not all(x in v for x in ("income_probs", "education_probs")):
+            continue
+        out[k] = v
+    return out
+
+
+def _save_tract_acs_disk_cache(entries: dict[str, dict[str, Any]]) -> None:
+    payload = {"_version": _CACHE_VERSION, "entries": dict(sorted(entries.items()))}
+    _atomic_write_json(_tract_acs_cache_path(), payload)
 
 
 class CensusGeocodeResult(BaseModel):
@@ -89,6 +188,7 @@ def batch_geocode(
     max_buildings: int = 500,
     sleep_between: float = 0.03,
     coord_round_decimals: int = 5,
+    use_disk_cache: bool = True,
 ) -> pd.DataFrame:
     """Geocode a DataFrame of buildings, adding ``state_fips``, ``county_fips``,
     ``tract_fips``, and ``geoid`` columns.
@@ -104,10 +204,14 @@ def batch_geocode(
         max_buildings:  Cap on number of buildings considered (for performance).
         sleep_between:  Seconds to sleep between distinct geocoder calls.
         coord_round_decimals: Decimal places for deduplicating coordinates (~1.1 m at 5).
+        use_disk_cache: Persist / load results under ``outputs/census_cache/geocode_cache.json``.
 
     Returns:
         DataFrame with census columns added (NaN where lookup failed).
     """
+    geo_disk: dict[str, dict[str, str]] = _load_geocode_disk_cache() if use_disk_cache else {}
+    geo_dirty = False
+
     out = df.copy()
     for col in ["state_fips", "county_fips", "tract_fips", "geoid"]:
         out[col] = None
@@ -135,16 +239,48 @@ def batch_geocode(
     n_unique = len(buckets)
     logger.info(f"Geocoding {n_unique} distinct coordinate(s) for {rows_to_process} row(s).")
 
+    n_from_cache = 0
     for (lat_f, lon_f), idx_list in buckets.items():
-        result = geocode_point(lat_f, lon_f)
+        ckey = _coord_cache_key(lat_f, lon_f, coord_round_decimals)
+        result: CensusGeocodeResult | None = None
+        from_disk = bool(use_disk_cache and ckey in geo_disk)
+        if from_disk:
+            d = geo_disk[ckey]
+            result = CensusGeocodeResult(
+                state=d["state"],
+                county=d["county"],
+                tract=d["tract"],
+                geoid=d["geoid"],
+            )
+            n_from_cache += 1
+        else:
+            result = geocode_point(lat_f, lon_f)
+            if result and (result.geoid or result.state) and use_disk_cache:
+                geo_disk[ckey] = {
+                    "state": result.state,
+                    "county": result.county,
+                    "tract": result.tract,
+                    "geoid": result.geoid,
+                }
+                geo_dirty = True
+            if sleep_between > 0:
+                time.sleep(sleep_between)
         if result and (result.geoid or result.state):
             for idx in idx_list:
                 out.at[idx, "state_fips"] = result.state
                 out.at[idx, "county_fips"] = result.county
                 out.at[idx, "tract_fips"] = result.tract
                 out.at[idx, "geoid"] = result.geoid
-        if sleep_between > 0:
-            time.sleep(sleep_between)
+
+    if geo_dirty:
+        try:
+            _save_geocode_disk_cache(geo_disk)
+            logger.info("Wrote geocode cache to %s", _geocode_cache_path())
+        except OSError as exc:
+            logger.warning("Could not save geocode cache: %s", exc)
+
+    if n_from_cache and use_disk_cache:
+        logger.info("Geocode: %s coordinate(s) loaded from disk cache.", n_from_cache)
 
     geocoded = out["geoid"].notna().sum()
     logger.info(f"Geocoded {geocoded}/{rows_to_process} buildings.")
@@ -264,16 +400,30 @@ def enrich_with_census(
     lat_col: str = "lat",
     lon_col: str = "lon",
     max_buildings: int = 500,
+    use_disk_cache: bool = True,
 ) -> pd.DataFrame:
     """Geocode buildings and fetch ACS demographics, returning an enriched DataFrame.
 
     Adds columns: ``state_fips``, ``county_fips``, ``tract_fips``, ``geoid``,
     ``income_probs``, ``education_probs``, ``household_probs`` (lists per row).
-    """
-    out = batch_geocode(df, lat_col=lat_col, lon_col=lon_col, max_buildings=max_buildings)
 
-    # fetch demographics per unique tract (not per row)
-    tract_cache: dict[tuple, dict | None] = {}
+    When ``use_disk_cache`` is True, geocoder and ACS results are read from and
+    appended to JSON files under ``outputs/census_cache/`` so repeat runs for the
+    same coordinates or tracts avoid network calls.
+    """
+    out = batch_geocode(
+        df,
+        lat_col=lat_col,
+        lon_col=lon_col,
+        max_buildings=max_buildings,
+        use_disk_cache=use_disk_cache,
+    )
+
+    tract_disk: dict[str, dict[str, Any]] = _load_tract_acs_disk_cache() if use_disk_cache else {}
+    tract_dirty = False
+    tract_cache: dict[str, dict | None] = {}
+    n_acs_from_disk = 0
+
     for col in ["income_probs", "education_probs", "household_probs"]:
         out[col] = None
 
@@ -283,16 +433,33 @@ def enrich_with_census(
         tract = out.at[idx, "tract_fips"]
         if not all([state, county, tract]):
             continue
-        key = (state, county, tract)
-        if key not in tract_cache:
-            tract_cache[key] = fetch_tract_demographics(state, county, tract, api_key)
-            time.sleep(0.08)
-        demo = tract_cache[key]
+        key_str = _tract_cache_key(str(state), str(county), str(tract))
+        if key_str not in tract_cache:
+            if use_disk_cache and key_str in tract_disk:
+                tract_cache[key_str] = tract_disk[key_str]
+                n_acs_from_disk += 1
+            else:
+                tract_cache[key_str] = fetch_tract_demographics(state, county, tract, api_key)
+                if tract_cache[key_str] and use_disk_cache:
+                    tract_disk[key_str] = tract_cache[key_str]
+                    tract_dirty = True
+                time.sleep(0.08)
+        demo = tract_cache[key_str]
         if demo:
             out.at[idx, "income_probs"] = demo["income_probs"]
             out.at[idx, "education_probs"] = demo["education_probs"]
             hp = demo.get("household_probs")
             out.at[idx, "household_probs"] = hp if hp is not None else [1.0 / 7.0] * 7
+
+    if tract_dirty:
+        try:
+            _save_tract_acs_disk_cache(tract_disk)
+            logger.info("Wrote ACS tract cache to %s", _tract_acs_cache_path())
+        except OSError as exc:
+            logger.warning("Could not save ACS tract cache: %s", exc)
+
+    if n_acs_from_disk and use_disk_cache:
+        logger.info("ACS: %s tract(s) loaded from disk cache.", n_acs_from_disk)
 
     return out
 

@@ -713,7 +713,8 @@ def _render_config_tab() -> None:
         st.markdown(
             "Without a census file, the app calls the Census Geocoder and ACS APIs once "
             "per **distinct** building location (rounded lat/lon) and once per census tract "
-            "— fast for a single tract, slower for scattered sites. Upload a **tract-level** "
+            "— fast for a single tract, slower for scattered sites. Results are saved under "
+            "`outputs/census_cache/` so the next run for the same area reuses them. Upload a **tract-level** "
             "tract-level census CSV (income, education, and household columns per tract, "
             "same schema as the engine's census_data_path input) "
             "to skip those calls entirely and use precomputed distributions."
