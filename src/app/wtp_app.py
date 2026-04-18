@@ -459,86 +459,86 @@ def _render_upload_tab() -> None:
 
     # ── Input mode toggle ─────────────────────────────────────────────────────
     st.divider()
+    _um = st.session_state.get("upload_mode")
+    if _um in ("Browse directory", "Browse outputs folder"):
+        st.session_state["upload_mode"] = "Browse data inputs"
     upload_mode = st.radio(
         "File input method",
-        ["Upload files", "Browse directory"],
+        ["Upload files", "Browse data inputs"],
         horizontal=True,
         key="upload_mode",
         help=(
             "**Upload files** — drag-and-drop or click to upload parquet files directly. "
-            "**Browse directory** — point to a folder on the server and pick files from dropdowns."
+            "**Browse data inputs** — pick `.pq` / `.parquet` files under `data/inputs/` "
+            "(Docker mounts the host `./data` tree at `/code/data`)."
         ),
     )
 
     year_files: dict = st.session_state.get("year_files", {})
 
-    # ── Browse directory mode ─────────────────────────────────────────────────
-    if upload_mode == "Browse directory":
-        dir_input = st.text_input(
-            "Data directory path",
-            placeholder="e.g. /code/data/inputs/example-p3  or  /Users/me/simulations",
-            key="dir_browse_path",
-            help="Absolute path to a folder containing .pq or .parquet files. Sub-folders are included.",
+    # ── browse data/inputs/ (host ./data mounted at /code/data in docker) ────
+    if upload_mode == "Browse data inputs":
+        dir_p = _DATA_DIR.resolve()
+        st.caption(
+            f"Parquet files under **`data/inputs/`** — `{dir_p}`. "
+            "Subfolders are included."
         )
-        dir_p = Path(dir_input.strip()) if dir_input.strip() else None
+        pq_files = sorted(
+            list(dir_p.glob("**/*.pq")) + list(dir_p.glob("**/*.parquet"))
+        )
+        if not pq_files:
+            st.warning(
+                "No `.pq` or `.parquet` files in `data/inputs/`. "
+                "Add files there or use **Upload files**."
+            )
+        else:
+            rel_paths = [str(f.relative_to(dir_p)) for f in pq_files]
+            file_options = ["— select —"] + rel_paths
+            st.caption(f"Found **{len(pq_files)}** parquet file(s).")
+            st.divider()
 
-        if dir_p is not None:
-            if not dir_p.exists() or not dir_p.is_dir():
-                st.error(f"Directory not found: `{dir_p}`")
-            else:
-                pq_files = sorted(
-                    list(dir_p.glob("**/*.pq")) + list(dir_p.glob("**/*.parquet"))
-                )
-                if not pq_files:
-                    st.warning("No `.pq` or `.parquet` files found in this directory.")
-                else:
-                    rel_paths = [str(f.relative_to(dir_p)) for f in pq_files]
-                    file_options = ["— select —"] + rel_paths
-                    st.caption(f"Found **{len(pq_files)}** parquet file(s) in `{dir_p}`.")
-                    st.divider()
+            for yr in selected_years:
+                with st.expander(f"Year {yr}", expanded=True):
+                    col_b, col_s = st.columns(2)
+                    entry = year_files.get(yr, {})
 
-                    for yr in selected_years:
-                        with st.expander(f"Year {yr}", expanded=True):
-                            col_b, col_s = st.columns(2)
-                            entry = year_files.get(yr, {})
+                    with col_b:
+                        st.markdown("**Baseline**")
+                        base_sel = st.selectbox(
+                            f"Baseline {yr}", options=file_options,
+                            key=f"dir_base_{yr}", label_visibility="collapsed",
+                        )
+                        if base_sel != "— select —":
+                            data = (dir_p / base_sel).read_bytes()
+                            entry = {**entry, "baseline": data}
+                            st.session_state["_example_preloaded"] = False
+                            info = _preview_parquet(data)
+                            if "error" in info:
+                                st.error(info["error"])
+                            else:
+                                _show_file_kpis(info, "Baseline")
+                        elif entry.get("baseline") is not None:
+                            st.caption("✓ Previously selected")
 
-                            with col_b:
-                                st.markdown("**Baseline**")
-                                base_sel = st.selectbox(
-                                    f"Baseline {yr}", options=file_options,
-                                    key=f"dir_base_{yr}", label_visibility="collapsed",
-                                )
-                                if base_sel != "— select —":
-                                    data = (dir_p / base_sel).read_bytes()
-                                    entry = {**entry, "baseline": data}
-                                    st.session_state["_example_preloaded"] = False
-                                    info = _preview_parquet(data)
-                                    if "error" in info:
-                                        st.error(info["error"])
-                                    else:
-                                        _show_file_kpis(info, "Baseline")
-                                elif entry.get("baseline") is not None:
-                                    st.caption("✓ Previously selected")
+                    with col_s:
+                        st.markdown(f"**{st.session_state['scenario_name']}**")
+                        scen_sel = st.selectbox(
+                            f"Scenario {yr}", options=file_options,
+                            key=f"dir_scen_{yr}", label_visibility="collapsed",
+                        )
+                        if scen_sel != "— select —":
+                            data = (dir_p / scen_sel).read_bytes()
+                            entry = {**entry, "scenario": data}
+                            st.session_state["_example_preloaded"] = False
+                            info = _preview_parquet(data)
+                            if "error" in info:
+                                st.error(info["error"])
+                            else:
+                                _show_file_kpis(info, st.session_state["scenario_name"])
+                        elif entry.get("scenario") is not None:
+                            st.caption("✓ Previously selected")
 
-                            with col_s:
-                                st.markdown(f"**{st.session_state['scenario_name']}**")
-                                scen_sel = st.selectbox(
-                                    f"Scenario {yr}", options=file_options,
-                                    key=f"dir_scen_{yr}", label_visibility="collapsed",
-                                )
-                                if scen_sel != "— select —":
-                                    data = (dir_p / scen_sel).read_bytes()
-                                    entry = {**entry, "scenario": data}
-                                    st.session_state["_example_preloaded"] = False
-                                    info = _preview_parquet(data)
-                                    if "error" in info:
-                                        st.error(info["error"])
-                                    else:
-                                        _show_file_kpis(info, st.session_state["scenario_name"])
-                                elif entry.get("scenario") is not None:
-                                    st.caption("✓ Previously selected")
-
-                            year_files[yr] = entry
+                    year_files[yr] = entry
 
     # ── Upload files mode (original) ──────────────────────────────────────────
     else:
