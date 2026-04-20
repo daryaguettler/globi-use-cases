@@ -127,8 +127,8 @@ class PropensityModelEngine(BaseModel):
     Args:
         policy_impacts_path: Path to policy impacts parquet (output of
             ``RetrofitScenarioAnalyzer.compute_all_scenario_costs``).
-        census_data_path: Path to census data CSV with tract-level demographic
-            distributions.  Optional; if absent, uniform defaults are used.
+        census_data_path: Path to tract-level demographics (CSV or Parquet) with
+            income, education, and household columns.  Optional; if absent, uniform defaults are used.
         climate_opinions_path: Optional path to county-level climate opinions CSV.
         enhanced_building_data_path: Optional path to enhanced building parquet.
         params_path: Optional path to params.yaml for loading configuration.
@@ -263,7 +263,11 @@ class PropensityModelEngine(BaseModel):
             logger.warning("Census data not found, will use default distributions")
             return None
 
-        df = pd.read_csv(self.census_data_path)
+        path = Path(self.census_data_path)
+        if path.suffix.lower() in (".parquet", ".pq"):
+            df = pd.read_parquet(path)
+        else:
+            df = pd.read_csv(path)
 
         def _to_int(code: object) -> int | None:
             try:

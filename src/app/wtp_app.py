@@ -711,23 +711,32 @@ def _render_config_tab() -> None:
 
     if is_us:
         st.markdown(
-            "Without a census file, the app calls the Census Geocoder and ACS APIs once "
-            "per **distinct** building location (rounded lat/lon) and once per census tract "
-            "— fast for a single tract, slower for scattered sites. Results are saved under "
-            "`outputs/census_cache/` so the next run for the same area reuses them. Upload a **tract-level** "
-            "tract-level census CSV (income, education, and household columns per tract, "
-            "same schema as the engine's census_data_path input) "
+            "Without a census file, the app loads **bundled** ACS tracts from "
+            "`data/inputs/census_tract_acs/states/{state_fips}.parquet` for each state that "
+            "appears after geocoding (MA, AZ, and WA are shipped). Other states use the Census "
+            "API once per tract; geocoder results are still saved under `outputs/census_cache/`. "
+            "Upload a **tract-level** "
+            "census file — CSV or Parquet — with income, education, and household columns per tract "
+            "(same schema as the engine's ``census_data_path`` input) "
             "to skip those calls entirely and use precomputed distributions."
         )
         census_file = st.file_uploader(
-            "Census CSV (optional — skips geocoder + ACS when set)",
-            type=["csv"], key="cfg_census_csv",
+            "Census tract file (optional — skips geocoder + ACS when set)",
+            type=["csv", "parquet", "pq"], key="cfg_census_csv",
         )
         if census_file is not None:
             st.session_state["census_csv_bytes"] = census_file.read()
-            st.success("Census CSV uploaded.")
+            fn = (census_file.name or "").lower()
+            if fn.endswith(".parquet"):
+                st.session_state["census_upload_suffix"] = ".parquet"
+            elif fn.endswith(".pq"):
+                st.session_state["census_upload_suffix"] = ".pq"
+            else:
+                st.session_state["census_upload_suffix"] = ".csv"
+            st.success("Census file uploaded.")
         else:
             st.session_state.setdefault("census_csv_bytes", None)
+            st.session_state.setdefault("census_upload_suffix", ".csv")
 
         api_key = st.text_input(
             "Census API key (optional)",
@@ -1497,7 +1506,8 @@ def _run_pipeline(simulated_years: list[int]) -> None:
     try:
         if st.session_state.get("census_csv_bytes"):
             import tempfile, os
-            tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+            suf = st.session_state.get("census_upload_suffix", ".csv")
+            tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
             tmp.write(st.session_state["census_csv_bytes"])
             tmp.close()
             census_path = tmp.name

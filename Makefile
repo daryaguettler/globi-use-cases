@@ -1,10 +1,13 @@
-.PHONY: install viz viz-down down viz-logs run run-local editor docker-build docker-run docker-stop clean
+.PHONY: install fetch-census-bundle viz viz-down down viz-logs run run-local editor docker-build docker-run docker-stop clean
 
 VIZ_COMPOSE  ?= docker compose -f docker-compose.yml -f docker-compose.st.yml
 OPEN_BROWSER ?= 1
 
 install:
 	uv sync
+
+fetch-census-bundle: ## download ACS tract demographics for MA, AZ, WA (requires network)
+	PYTHONPATH=src uv run python scripts/fetch_bundled_census_ma_az_wa.py
 
 .PHONY: copy-env
 copy-env: ## Copy `.env.example` to `.env` if `.env` does not exist

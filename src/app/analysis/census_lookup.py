@@ -8,6 +8,10 @@ Successful geocoder and ACS responses are persisted under ``outputs/census_cache
 (JSON) so repeat runs for the same coordinates or tracts skip network calls.
 Override the directory with env ``GLOBI_CENSUS_CACHE_DIR``.
 
+Pre-shipped ACS **tract** tables live under ``data/inputs/census_tract_acs/states/{state_fips}.parquet``
+(two-digit FIPS, e.g. ``25.parquet``). Only files for states present in the
+geocoded cohort are loaded at run time.
+
 For non-US data, ``build_prior_distributions`` converts user-specified
 distribution parameters into the format expected by PropensityModelEngine.
 """
@@ -330,6 +334,125 @@ _ACS_HH_VARS = [
 ]
 
 
+def demographics_from_acs_data_dict(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Map ACS5 variable dict (from API) to normalised income/education/household probs."""
+    try:
+
+        def _i(v: object) -> int:
+            try:
+                return max(0, int(float(v)))
+            except (TypeError, ValueError):
+                return 0
+
+        income_counts = np.array([_i(data.get(v, 0)) for v in _ACS_INCOME_VARS], dtype=float)
+        edu_raw = np.array([_i(data.get(v, 0)) for v in _ACS_EDU_VARS], dtype=float)
+        edu_counts = np.array(
+            [
+                edu_raw[0] + edu_raw[1] + edu_raw[2] + edu_raw[3],
+                edu_raw[4],
+                edu_raw[5],
+                edu_raw[6] + edu_raw[7] + edu_raw[8],
+            ],
+            dtype=float,
+        )
+        hh_counts = np.array([_i(data.get(v, 0)) for v in _ACS_HH_VARS], dtype=float)
+
+        def _normalise(arr: np.ndarray) -> np.ndarray:
+            s = arr.sum()
+            return arr / s if s > 0 else np.ones_like(arr) / len(arr)
+
+        return {
+            "income_probs": _normalise(income_counts).tolist(),
+            "education_probs": _normalise(edu_counts).tolist(),
+            "household_probs": _normalise(hh_counts).tolist(),
+        }
+    except Exception:
+        return None
+
+
+# in-memory cache: state_fips (2-digit) -> geoid -> demo dict (from states/{fips}.parquet)
+_bundled_state_parquet_cache: dict[str, dict[str, dict[str, Any]]] = {}
+
+
+def _bundled_states_dir() -> Path:
+    return _repo_root() / "data" / "inputs" / "census_tract_acs" / "states"
+
+
+def list_bundled_state_parquet_fips() -> frozenset[str]:
+    """State FIPS (2-digit str) that have a ``states/{fips}.parquet`` file on disk."""
+    d = _bundled_states_dir()
+    if not d.is_dir():
+        return frozenset()
+    out: set[str] = set()
+    for p in d.glob("*.parquet"):
+        stem = p.stem.strip()
+        if stem.isdigit() and len(stem) <= 2:
+            out.add(stem.zfill(2))
+    return frozenset(out)
+
+
+def _dataframe_to_geoid_demo_dict(df: pd.DataFrame) -> dict[str, dict[str, Any]]:
+    """Build geoid -> demographics dict from a tract-level ACS dataframe."""
+    if "geoid" not in df.columns:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for _, row in df.iterrows():
+        gid = str(row["geoid"]).strip()
+        if not gid:
+            continue
+        r = row.to_dict()
+        demo: dict[str, Any] | None = None
+        if all(c in df.columns for c in ("income_probs", "education_probs", "household_probs")):
+            demo = {
+                "income_probs": list(r["income_probs"]),
+                "education_probs": list(r["education_probs"]),
+                "household_probs": list(r["household_probs"]),
+            }
+        else:
+            demo = demographics_from_acs_data_dict(r)
+        if demo is None:
+            continue
+        if "county_name" in df.columns and pd.notna(row.get("county_name")):
+            demo["county_name"] = str(row["county_name"]).strip()
+        out[gid] = demo
+    return out
+
+
+def load_bundled_acs_for_state_fips(state_fips_needed: set[str]) -> dict[str, dict[str, Any]]:
+    """Merge geoid -> demographics for each needed state that has ``states/{fips}.parquet``.
+
+    Only states present in *state_fips_needed* are read from disk (e.g. only MA
+    when all buildings geocode to Massachusetts).
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    loaded: list[str] = []
+    for raw in state_fips_needed:
+        st = str(raw).strip().zfill(2)
+        if st in _bundled_state_parquet_cache:
+            merged.update(_bundled_state_parquet_cache[st])
+            loaded.append(st)
+            continue
+        path = _bundled_states_dir() / f"{st}.parquet"
+        if not path.is_file():
+            continue
+        try:
+            df = pd.read_parquet(path)
+        except Exception as exc:
+            logger.warning("Could not read bundled state ACS %s: %s", path, exc)
+            continue
+        block = _dataframe_to_geoid_demo_dict(df)
+        _bundled_state_parquet_cache[st] = block
+        merged.update(block)
+        loaded.append(st)
+    if merged and loaded:
+        logger.info(
+            "Bundled ACS: %s tract rows from state file(s) %s",
+            len(merged),
+            ", ".join(sorted(set(loaded))),
+        )
+    return merged
+
+
 def fetch_tract_demographics(
     state_fips: str,
     county_fips: str,
@@ -359,36 +482,7 @@ def fetch_tract_demographics(
         headers = rows[0]
         vals = rows[1]
         data = dict(zip(headers, vals))
-
-        income_counts = np.array(
-            [max(0, int(data.get(v, 0) or 0)) for v in _ACS_INCOME_VARS],
-            dtype=float,
-        )
-        edu_raw = np.array(
-            [max(0, int(data.get(v, 0) or 0)) for v in _ACS_EDU_VARS],
-            dtype=float,
-        )
-        # Collapse education into 4 categories: HS/GED, Associates, Bachelors, Graduate
-        edu_counts = np.array([
-            edu_raw[0] + edu_raw[1] + edu_raw[2] + edu_raw[3],  # HS / some college
-            edu_raw[4],                                           # Associates
-            edu_raw[5],                                           # Bachelors
-            edu_raw[6] + edu_raw[7] + edu_raw[8],                # Graduate
-        ], dtype=float)
-        hh_counts = np.array(
-            [max(0, int(data.get(v, 0) or 0)) for v in _ACS_HH_VARS],
-            dtype=float,
-        )
-
-        def _normalise(arr: np.ndarray) -> np.ndarray:
-            s = arr.sum()
-            return arr / s if s > 0 else np.ones_like(arr) / len(arr)
-
-        return {
-            "income_probs": _normalise(income_counts).tolist(),
-            "education_probs": _normalise(edu_counts).tolist(),
-            "household_probs": _normalise(hh_counts).tolist(),
-        }
+        return demographics_from_acs_data_dict(data)
     except Exception as exc:
         logger.debug(f"ACS fetch failed for {state_fips}/{county_fips}/{tract_fips}: {exc}")
         return None
@@ -419,13 +513,19 @@ def enrich_with_census(
         use_disk_cache=use_disk_cache,
     )
 
+    need_states: set[str] = set()
+    for v in out["state_fips"].dropna().unique():
+        need_states.add(str(v).strip().zfill(2))
+    bundled_by_geoid = load_bundled_acs_for_state_fips(need_states)
     tract_disk: dict[str, dict[str, Any]] = _load_tract_acs_disk_cache() if use_disk_cache else {}
     tract_dirty = False
     tract_cache: dict[str, dict | None] = {}
     n_acs_from_disk = 0
+    n_acs_from_bundle = 0
 
     for col in ["income_probs", "education_probs", "household_probs"]:
         out[col] = None
+    out["census_tract_county_name"] = None
 
     for idx in out.index:
         state = out.at[idx, "state_fips"]
@@ -434,8 +534,19 @@ def enrich_with_census(
         if not all([state, county, tract]):
             continue
         key_str = _tract_cache_key(str(state), str(county), str(tract))
+        gid = str(out.at[idx, "geoid"]).strip() if pd.notna(out.at[idx, "geoid"]) else ""
+        state_st = str(state).strip().zfill(2)
+
         if key_str not in tract_cache:
-            if use_disk_cache and key_str in tract_disk:
+            if bundled_by_geoid and gid and gid in bundled_by_geoid:
+                b = bundled_by_geoid[gid]
+                tract_cache[key_str] = {
+                    "income_probs": b["income_probs"],
+                    "education_probs": b["education_probs"],
+                    "household_probs": b.get("household_probs"),
+                }
+                n_acs_from_bundle += 1
+            elif use_disk_cache and key_str in tract_disk:
                 tract_cache[key_str] = tract_disk[key_str]
                 n_acs_from_disk += 1
             else:
@@ -444,12 +555,17 @@ def enrich_with_census(
                     tract_disk[key_str] = tract_cache[key_str]
                     tract_dirty = True
                 time.sleep(0.08)
+
         demo = tract_cache[key_str]
         if demo:
             out.at[idx, "income_probs"] = demo["income_probs"]
             out.at[idx, "education_probs"] = demo["education_probs"]
             hp = demo.get("household_probs")
             out.at[idx, "household_probs"] = hp if hp is not None else [1.0 / 7.0] * 7
+            if gid and bundled_by_geoid and gid in bundled_by_geoid:
+                cn = bundled_by_geoid[gid].get("county_name")
+                if cn:
+                    out.at[idx, "census_tract_county_name"] = cn
 
     if tract_dirty:
         try:
@@ -458,6 +574,8 @@ def enrich_with_census(
         except OSError as exc:
             logger.warning("Could not save ACS tract cache: %s", exc)
 
+    if n_acs_from_bundle:
+        logger.info("ACS: %s tract lookup(s) served from bundled state Parquet file(s).", n_acs_from_bundle)
     if n_acs_from_disk and use_disk_cache:
         logger.info("ACS: %s tract(s) loaded from disk cache.", n_acs_from_disk)
 
@@ -490,9 +608,11 @@ def tract_distributions_from_enriched(
         edu = row.get("education_probs")
         if inc is None or edu is None:
             continue
-        cfi = row.get("county_fips")
         county_name = ""
-        if cfi is not None and pd.notna(cfi):
+        if "census_tract_county_name" in df.columns and pd.notna(row.get("census_tract_county_name")):
+            county_name = str(row["census_tract_county_name"]).strip()
+        cfi = row.get("county_fips")
+        if not county_name and cfi is not None and pd.notna(cfi):
             try:
                 ck = int(float(str(cfi).split(".")[0]))
                 county_name = county_fips_map.get(ck) or ""
