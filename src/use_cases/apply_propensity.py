@@ -360,22 +360,27 @@ class PropensityModelEngine(BaseModel):
             }
         logger.info(f"Precomputed distributions for {len(self.tract_distributions)} tracts")
 
-    def _sample_demographics(
+    def _resolve_tract_dist_for_sampling(
         self,
         county: str,
         tract_id: str | None = None,
-        n_samples: int = 1,
         geoid: str | None = None,
-    ) -> dict[str, np.ndarray]:
+    ) -> dict | None:
+        """Tract demographics dict (income/education/household_size arrays) or None for uniform MC."""
+        from app.analysis.census_lookup import canonical_census_geoid_str
+
         if geoid:
-            g = str(geoid).strip()
-            if g in self.tract_distributions:
-                dist = self.tract_distributions[g]
-                return {
-                    "education": self.rng.choice(EDUCATION_CATEGORIES, size=n_samples, p=dist["education"]),
-                    "household_size": self.rng.choice(HOUSEHOLD_SIZE_CATEGORIES, size=n_samples, p=dist["household_size"]),
-                    "income": self.rng.choice(INCOME_CATEGORIES, size=n_samples, p=dist["income"]),
-                }
+            gc = canonical_census_geoid_str(geoid)
+            dist = None
+            if gc and gc in self.tract_distributions:
+                dist = self.tract_distributions[gc]
+            elif gc:
+                for k, d in self.tract_distributions.items():
+                    if canonical_census_geoid_str(k) == gc:
+                        dist = d
+                        break
+            if dist is not None:
+                return dist
 
         tract_key = None
         if tract_id is not None:
@@ -397,13 +402,47 @@ class PropensityModelEngine(BaseModel):
                     break
 
         if tract_key is None:
+            return None
+        return self.tract_distributions[tract_key]
+
+    def _income_education_pmfs(
+        self,
+        county: str,
+        tract_id: str | None = None,
+        geoid: str | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """16- and 4-bin PMFs aligned with INCOME_CATEGORIES / EDUCATION_CATEGORIES (same as cohort charts)."""
+        dist = self._resolve_tract_dist_for_sampling(county, tract_id, geoid)
+        if dist is None:
+            return np.ones(16, dtype=float) / 16.0, np.ones(4, dtype=float) / 4.0
+        inc = np.asarray(dist["income"], dtype=float).ravel()
+        edu = np.asarray(dist["education"], dtype=float).ravel()
+        if inc.size != 16 or not np.isfinite(inc).all():
+            inc = np.ones(16, dtype=float) / 16.0
+        else:
+            s = float(inc.sum())
+            inc = inc / s if s > 0 else np.ones(16, dtype=float) / 16.0
+        if edu.size != 4 or not np.isfinite(edu).all():
+            edu = np.ones(4, dtype=float) / 4.0
+        else:
+            s = float(edu.sum())
+            edu = edu / s if s > 0 else np.ones(4, dtype=float) / 4.0
+        return inc, edu
+
+    def _sample_demographics(
+        self,
+        county: str,
+        tract_id: str | None = None,
+        n_samples: int = 1,
+        geoid: str | None = None,
+    ) -> dict[str, np.ndarray]:
+        dist = self._resolve_tract_dist_for_sampling(county, tract_id, geoid)
+        if dist is None:
             return {
                 "education": self.rng.choice(EDUCATION_CATEGORIES, size=n_samples),
                 "household_size": self.rng.choice(HOUSEHOLD_SIZE_CATEGORIES, size=n_samples),
                 "income": self.rng.choice(INCOME_CATEGORIES, size=n_samples),
             }
-
-        dist = self.tract_distributions[tract_key]
         return {
             "education": self.rng.choice(EDUCATION_CATEGORIES, size=n_samples, p=dist["education"]),
             "household_size": self.rng.choice(HOUSEHOLD_SIZE_CATEGORIES, size=n_samples, p=dist["household_size"]),
@@ -483,6 +522,10 @@ class PropensityModelEngine(BaseModel):
         res_mask = self.data["building_type"] == "residential"
         com_mask = self.data["building_type"] == "commercial"
         logger.info(f"Residential: {res_mask.sum()}, Commercial: {com_mask.sum()}")
+
+        for _demo_col in ("income_probs", "education_probs"):
+            if _demo_col not in self.data.columns:
+                self.data[_demo_col] = None
 
         for col in ["acceptance_probability", "propensity_min", "propensity_max", "propensity_mean", "propensity_sd",
                     "acceptance_probability_min", "acceptance_probability_max", "acceptance_probability_mean",
@@ -581,12 +624,19 @@ class PropensityModelEngine(BaseModel):
             idx = np.array(indices)
             m = len(idx)
             if gkey[0] == "geoid":
+                inc_p, edu_p = self._income_education_pmfs("", None, gkey[1])
                 demo = self._sample_demographics("", tract_id=None, n_samples=m * n_samples, geoid=gkey[1])
                 cname = (self.tract_distributions.get(gkey[1]) or {}).get("county") or ""
             else:
                 _, county, tract_str = gkey
+                inc_p, edu_p = self._income_education_pmfs(str(county), tract_str or None, None)
                 demo = self._sample_demographics(county, tract_id=tract_str or None, n_samples=m * n_samples)
                 cname = county
+            ip_list = [float(x) for x in inc_p]
+            ep_list = [float(x) for x in edu_p]
+            ridx = sub.index[idx]
+            self.data.loc[ridx, "income_probs"] = pd.Series([ip_list] * m, index=ridx, dtype=object)
+            self.data.loc[ridx, "education_probs"] = pd.Series([ep_list] * m, index=ridx, dtype=object)
             concern = self.county_concern.get(cname, 3.5)
 
             edu = demo["education"].reshape(m, n_samples)

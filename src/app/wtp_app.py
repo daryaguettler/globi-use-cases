@@ -57,11 +57,24 @@ from app.analysis.energy_delta import (
     rotated_rectangle_column,
 )
 from app.analysis.adoption_breakdown import (
-    build_adoption_cohort_by_demographics,
     build_adoption_finance_breakdown_dataframe,
+    build_income_portfolio_adoption_profile,
+    fill_missing_demographic_probs,
+    last_year_uptake_row,
+    n_adopters_from_yearly_row,
     pick_adoption_scenario_for_cohort_breakdown,
+    resolve_retrofit_scenario_name,
+    retrofit_cost_column_for_policy,
 )
-from app.analysis.emissions_calc import compute_emissions_trajectory
+from app.analysis.emissions_calc import compute_emissions_trajectory, prepare_yearly_summary_for_charts
+from app.input_presets import (
+    MODE_BATCH,
+    MODE_BROWSE,
+    MODE_PER_YEAR,
+    apply_input_preset,
+    build_input_preset_dict,
+    preset_json_dumps,
+)
 from use_cases.apply_propensity import (
     MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
     MEAN_ACCEPTANCE_AGGREGATE_LABEL,
@@ -76,6 +89,7 @@ _ADOPTION_CURVES_PATH = _DATA_DIR / "adoption_curves.json"
 _EMISSIONS_PATH = _DATA_DIR / "emissions_trajectories.json"
 _CONFIGS_DIR = _REPO_ROOT / "data" / "outputs"
 _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+_INPUT_PRESETS_DIR = _CONFIGS_DIR / "input_presets"
 
 _SCENARIOS_DIR = _REPO_ROOT / "outputs"
 _SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
@@ -168,6 +182,12 @@ E_{\mathrm{stock}}(t) = \sum_{\text{buildings } i}
 $$
 
 with \(\alpha_i(t)\) the adopted fraction implied by cumulative adoption at \(t\) (from the ensemble mean path for the **mean** line).
+
+**Uptake table vs policy:** If the yearly uptake table has several rows per calendar year (different ``retrofit.scenario`` labels), energy/emissions use the row that matches the **policy impacts** retrofit name (or an ``n_buildings``-weighted blend when needed). The chart line uses the same rule so adoption % and stock energy stay aligned.
+
+**Why savings can look small:** Portfolio kWh drops by roughly **adoption % \(\times\)** the per-building gap \((E_{\mathrm{baseline}} - E_{\mathrm{scenario}})\). If scenario kWh is only slightly below baseline in the parquet, even **11%** adoption moves the stock curve only a little versus the dotted baseline — that is expected, not a failure of the adoption %.
+
+**Why savings can jump faster than adoption %:** Adopters are the top **cumulative adoption %** of buildings by **propensity** (not a random sample). If propensity lines up with **large** per-building kWh reductions (e.g. after lowering \$/m² so the logit weighting favors high financial savings), the **first** cohort can account for a **large share** of total possible stock savings. The adoption curve only caps **how many buildings** adopt each year, not **how much** of portfolio kWh they represent.
 """
 
 _FORMULA_MD_EMISSIONS_TRAJECTORY = r"""
@@ -219,11 +239,11 @@ The KPI shows **min–max** of \(S_{\mathrm{cohort}}(a)\) across scenarios. This
 """
 
 _FORMULA_MD_ADOPTION_DEMO_BREAKDOWN = r"""
-### Adoption cohort by income / education (with incentive)
+### Adoption cohort by income (with incentive)
 
 **Who adopts?** The stock energy and emissions model ranks buildings by `acceptance_probability` and marks the first \(n\) rows as *adopted* for that year’s cumulative adoption %, where \(n = \mathrm{round}((A/100) \cdot N)\), \(A\) the mean cumulative % and \(N\) the number of policy rows.
 
-**Income and education bars:** Each building has **tract** multinomials (`income_probs`, `education_probs` from census). For a **stable, reproducible** label per building, we draw a single **deterministic** category index from that row’s using a fixed RNG seed derived from `building.id` (not the propensity MC). Counts in the bar chart are for the **with-incentive** final cohort of adopters (same \(n\) as above, ranked by with-incentive propensity). Commercial rows without tract lists may show **Unknown**.
+**Income figures:** One **sampled** income bin per building (16 bins; RNG seeded from `building.id`). **Chart 1 — portfolio:** % of the portfolio in each bin (sums to 100%). **Chart 2 — 100% stacked bars (within each bin):** (i) % in the no-incentive top-\(n\) ranking, (ii) **additional** % in the with-incentive top-\(n\) but not the no-incentive top-\(n\) — **only attributed** when that bin’s Configure-tab incentive for its income midpoint is **> 0** (tiers at \$0 show **0** lift), (iii) remainder = did not rank in the no-incentive top-\(n\) at this cutoff. With **no** incentive run, (ii) is zero and the stack is adoption vs. non-adoption only. \(n = \min(\text{adopters for the selected curve}, N)\). Rows with no tract PMF: **Unknown**.
 
 ### Incentive / ranking comparison (same n)
 
@@ -348,6 +368,15 @@ for _z in range(10, 20):
     _code = f"EPSG:{32600 + _z}"
     _FOOTPRINT_CRS_OPTIONS.append((_code, f"{_code} — UTM zone {_z}N"))
 _FOOTPRINT_CRS_OPTIONS.append(("custom", "Custom EPSG…"))
+
+_CRS_TROUBLESHOOT_EXPANDER_LABEL = "Did your census lookup not work? Update your CRS here!"
+
+
+def _census_crs_troubleshoot_hint() -> str:
+    return (
+        "Wrong footprint coordinates often mean the CRS is mis-set. Go to **Step 1 — Upload Energy Data**, "
+        f"open **{_CRS_TROUBLESHOOT_EXPANDER_LABEL}**, set **Footprint source CRS**, then run this lookup again."
+    )
 
 
 def _resolve_session_footprint_epsg() -> str | None:
@@ -490,6 +519,126 @@ def _load_config(name: str) -> bool:
         st.session_state["incentive_config"] = IncentiveConfig(**config["incentive_config"])
 
     return True
+
+
+# ── Input presets (energy file layout per year) ───────────────────────────────
+
+def _list_input_presets() -> list[str]:
+    if not _INPUT_PRESETS_DIR.is_dir():
+        return []
+    return sorted(p.stem for p in _INPUT_PRESETS_DIR.glob("*.json"))
+
+
+def _save_input_preset(name: str) -> tuple[bool, str]:
+    clean = name.strip().replace(" ", "_")
+    if not clean:
+        return False, ""
+    payload = build_input_preset_dict(
+        str(st.session_state.get("upload_mode", MODE_BROWSE)),
+        int(st.session_state.get("n_years", 1)),
+        list(st.session_state.get("selected_years", [2025])),
+        str(st.session_state.get("scenario_name", "Retrofit")),
+        st.session_state.get("year_files", {}),
+    )
+    _INPUT_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    (_INPUT_PRESETS_DIR / f"{clean}.json").write_text(preset_json_dumps(payload))
+    return True, clean
+
+
+def _apply_input_preset(name: str) -> tuple[bool, str]:
+    path = _INPUT_PRESETS_DIR / f"{name}.json"
+    if not path.is_file():
+        return False, "preset not found"
+    try:
+        preset = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return False, f"invalid json: {exc}"
+    result = apply_input_preset(
+        preset,
+        _DATA_DIR,
+        st.session_state.get("uploaded_pq_library") or {},
+    )
+    if not result.ok:
+        return False, result.error or "load failed"
+    ny = len(result.selected_years)
+    st.session_state["n_years"] = ny
+    st.session_state["upload_n_years"] = ny
+    st.session_state["selected_years"] = list(result.selected_years)
+    st.session_state["scenario_name"] = result.scenario_name
+    st.session_state["upload_scenario_name"] = result.scenario_name
+    for i, y in enumerate(result.selected_years):
+        st.session_state[f"upload_yr_{i}"] = int(y)
+    st.session_state["upload_mode"] = result.upload_mode
+    st.session_state["year_files"] = dict(result.year_files)
+    st.session_state["_example_preloaded"] = False
+    for yr in result.selected_years:
+        e = result.year_files.get(yr, {})
+        if result.upload_mode == MODE_BROWSE:
+            st.session_state[f"dir_base_{yr}"] = e.get("baseline_rel") or "— select —"
+            st.session_state[f"dir_scen_{yr}"] = e.get("scenario_rel") or "— select —"
+        elif result.upload_mode == MODE_BATCH:
+            st.session_state[f"batch_base_{yr}"] = e.get("baseline_label") or "— select —"
+            st.session_state[f"batch_scen_{yr}"] = e.get("scenario_label") or "— select —"
+    if result.warnings:
+        st.session_state["_input_preset_warnings"] = result.warnings
+    else:
+        st.session_state.pop("_input_preset_warnings", None)
+    return True, ""
+
+
+def _render_input_preset_manager() -> None:
+    st.sidebar.markdown("### Input presets")
+    st.sidebar.caption(
+        "Save which parquet files map to each year (**Browse** or **Upload many**). "
+        "Loading re-reads paths from `data/inputs/` or matches names in your upload pool."
+    )
+    warns = st.session_state.pop("_input_preset_warnings", None)
+    if warns:
+        for w in warns:
+            st.sidebar.warning(w)
+
+    saved = _list_input_presets()
+    if saved:
+        st.sidebar.markdown("**Load input preset**")
+        pick = st.sidebar.selectbox(
+            "Input preset", options=saved, key="input_preset_select",
+            label_visibility="collapsed",
+        )
+        if st.sidebar.button("Load preset", key="input_preset_load", use_container_width=True):
+            ok, err = _apply_input_preset(pick)
+            if ok:
+                st.sidebar.success(f"Loaded input preset '{pick}'")
+                st.rerun()
+            else:
+                st.sidebar.error(err or "Could not load preset.")
+    else:
+        st.sidebar.info("No input presets yet — save one below.")
+
+    st.sidebar.markdown("**Save input preset**")
+    ip_name = st.sidebar.text_input(
+        "Preset name", placeholder="e.g. team_suns_deep",
+        key="input_preset_new_name", label_visibility="collapsed",
+    )
+    mode = str(st.session_state.get("upload_mode", MODE_BROWSE))
+    per_year = mode == MODE_PER_YEAR
+    if st.sidebar.button(
+        "Save input preset",
+        key="input_preset_save",
+        disabled=not ip_name.strip() or per_year,
+        use_container_width=True,
+    ):
+        ok, clean = _save_input_preset(ip_name)
+        if ok:
+            st.sidebar.success(f"Saved input preset '{clean}'")
+            st.rerun()
+        else:
+            st.sidebar.error("Enter a preset name.")
+    if per_year:
+        st.sidebar.caption(
+            "**Upload files (per year)** cannot be captured in a preset — use **Browse** or **Upload many**."
+        )
+
+    st.sidebar.divider()
 
 
 # ── Scenario results saving/loading ───────────────────────────────────────────
@@ -848,15 +997,21 @@ def _render_upload_tab() -> None:
                         )
                         if base_sel != "— select —":
                             data = (dir_p / base_sel).read_bytes()
-                            entry = {**entry, "baseline": data}
+                            entry = {
+                                **entry,
+                                "baseline": data,
+                                "baseline_rel": str(base_sel).replace("\\", "/"),
+                            }
                             st.session_state["_example_preloaded"] = False
                             info = _preview_parquet(data)
                             if "error" in info:
                                 st.error(info["error"])
                             else:
                                 _show_file_kpis(info)
-                        elif entry.get("baseline") is not None:
-                            st.caption("✓ Previously selected")
+                        else:
+                            entry = dict(entry)
+                            entry.pop("baseline", None)
+                            entry.pop("baseline_rel", None)
 
                     with col_s:
                         st.markdown(f"**{st.session_state['scenario_name']}**")
@@ -866,15 +1021,21 @@ def _render_upload_tab() -> None:
                         )
                         if scen_sel != "— select —":
                             data = (dir_p / scen_sel).read_bytes()
-                            entry = {**entry, "scenario": data}
+                            entry = {
+                                **entry,
+                                "scenario": data,
+                                "scenario_rel": str(scen_sel).replace("\\", "/"),
+                            }
                             st.session_state["_example_preloaded"] = False
                             info = _preview_parquet(data)
                             if "error" in info:
                                 st.error(info["error"])
                             else:
                                 _show_file_kpis(info)
-                        elif entry.get("scenario") is not None:
-                            st.caption("✓ Previously selected")
+                        else:
+                            entry = dict(entry)
+                            entry.pop("scenario", None)
+                            entry.pop("scenario_rel", None)
 
                     year_files[yr] = entry
 
@@ -1037,63 +1198,64 @@ def _render_upload_tab() -> None:
 
     # ── Footprint CRS (reference baseline) ────────────────────────────────────
     st.divider()
-    st.markdown("### Building footprint CRS")
-    st.caption(
-        "rotated_rectangle may be WKB (Web Mercator) or WKT in projected metres (e.g. UTM). "
-        "Choose the CRS your files use, or leave Auto. Optional rewrite converts footprints "
-        "to WGS 84 WKT in memory for the rest of the session."
-    )
-    ref_yr_fp = None
-    for y in sorted(selected_years):
-        if year_files.get(y, {}).get("baseline"):
-            ref_yr_fp = y
-            break
-    if ref_yr_fp is None:
-        st.info("Upload a baseline file to inspect footprint geometry and set CRS.")
-    else:
-        try:
-            _fp_df = flatten_energy_parquet(year_files[ref_yr_fp]["baseline"])
-            finfo = footprint_geometry_summary(_fp_df)
-        except Exception as exc:
-            finfo = {"error": str(exc)}
-        if finfo.get("error"):
-            st.warning(f"Could not read footprint metadata: {finfo['error']}")
-        elif not finfo.get("has_footprint"):
-            st.info("No rotated_rectangle column in the reference baseline.")
-        else:
-            bx = finfo["bounds"]
-            st.markdown(
-                f"**Reference baseline (year {ref_yr_fp})** — `{finfo['column']}`, "
-                f"encoding **{finfo['encoding']}**, bounds "
-                f"({bx[0]:,.2f}, {bx[1]:,.2f}, {bx[2]:,.2f}, {bx[3]:,.2f})."
-            )
-            st.markdown(f"**Hint:** {finfo['structural_hint']}")
-            st.caption(
-                f"Auto-resolved EPSG (with current env): **{finfo['auto_resolved_epsg']}**. "
-                f"GLOBI_ROTATED_RECTANGLE_CRS is {'set' if finfo['env_globi_crs_set'] else 'unset'}; "
-                f"GLOBI_UTM_ZONE_N is {'set' if finfo['env_utm_zone_set'] else 'unset'}."
-            )
-    _fc_opts = [o[0] for o in _FOOTPRINT_CRS_OPTIONS]
-    _fc_lbl = dict(_FOOTPRINT_CRS_OPTIONS)
-    if st.session_state.get("footprint_crs_choice") not in _fc_opts:
-        st.session_state["footprint_crs_choice"] = "auto"
-    st.selectbox(
-        "Footprint source CRS",
-        options=_fc_opts,
-        format_func=lambda k: _fc_lbl[k],
-        key="footprint_crs_choice",
-    )
-    if st.session_state.get("footprint_crs_choice") == "custom":
-        st.text_input(
-            "Custom EPSG",
-            key="footprint_crs_custom",
-            placeholder="32612 or EPSG:32612",
+    with st.expander(_CRS_TROUBLESHOOT_EXPANDER_LABEL, expanded=False):
+        st.markdown("### Building footprint CRS")
+        st.caption(
+            "rotated_rectangle may be WKB (Web Mercator) or WKT in projected metres (e.g. UTM). "
+            "Choose the CRS your files use, or leave Auto. Optional rewrite converts footprints "
+            "to WGS 84 WKT in memory for the rest of the session."
         )
-    st.checkbox(
-        "Rewrite footprints to WGS 84 WKT after load (in memory only)",
-        key="rewrite_footprints_wgs84",
-        help="Projects using the CRS above once, then stores EPSG:4326 WKT for later steps.",
-    )
+        ref_yr_fp = None
+        for y in sorted(selected_years):
+            if year_files.get(y, {}).get("baseline"):
+                ref_yr_fp = y
+                break
+        if ref_yr_fp is None:
+            st.info("Upload a baseline file to inspect footprint geometry and set CRS.")
+        else:
+            try:
+                _fp_df = flatten_energy_parquet(year_files[ref_yr_fp]["baseline"])
+                finfo = footprint_geometry_summary(_fp_df)
+            except Exception as exc:
+                finfo = {"error": str(exc)}
+            if finfo.get("error"):
+                st.warning(f"Could not read footprint metadata: {finfo['error']}")
+            elif not finfo.get("has_footprint"):
+                st.info("No rotated_rectangle column in the reference baseline.")
+            else:
+                bx = finfo["bounds"]
+                st.markdown(
+                    f"**Reference baseline (year {ref_yr_fp})** — `{finfo['column']}`, "
+                    f"encoding **{finfo['encoding']}**, bounds "
+                    f"({bx[0]:,.2f}, {bx[1]:,.2f}, {bx[2]:,.2f}, {bx[3]:,.2f})."
+                )
+                st.markdown(f"**Hint:** {finfo['structural_hint']}")
+                st.caption(
+                    f"Auto-resolved EPSG (with current env): **{finfo['auto_resolved_epsg']}**. "
+                    f"GLOBI_ROTATED_RECTANGLE_CRS is {'set' if finfo['env_globi_crs_set'] else 'unset'}; "
+                    f"GLOBI_UTM_ZONE_N is {'set' if finfo['env_utm_zone_set'] else 'unset'}."
+                )
+        _fc_opts = [o[0] for o in _FOOTPRINT_CRS_OPTIONS]
+        _fc_lbl = dict(_FOOTPRINT_CRS_OPTIONS)
+        if st.session_state.get("footprint_crs_choice") not in _fc_opts:
+            st.session_state["footprint_crs_choice"] = "auto"
+        st.selectbox(
+            "Footprint source CRS",
+            options=_fc_opts,
+            format_func=lambda k: _fc_lbl[k],
+            key="footprint_crs_choice",
+        )
+        if st.session_state.get("footprint_crs_choice") == "custom":
+            st.text_input(
+                "Custom EPSG",
+                key="footprint_crs_custom",
+                placeholder="32612 or EPSG:32612",
+            )
+        st.checkbox(
+            "Rewrite footprints to WGS 84 WKT after load (in memory only)",
+            key="rewrite_footprints_wgs84",
+            help="Projects using the CRS above once, then stores EPSG:4326 WKT for later steps.",
+        )
 
     # ── Validation summary ─────────────────────────────────────────────────────
     st.divider()
@@ -1434,7 +1596,7 @@ def _render_census_tract_lookup() -> None:
                         "No rotated_rectangle or lat/lon columns found in the uploaded baseline file."
                     )
             except Exception as exc:
-                st.error(f"Census tract lookup failed: {exc}")
+                st.error(f"Census tract lookup failed: {exc}\n\n{_census_crs_troubleshoot_hint()}")
 
     tract_data = st.session_state.get("census_tract_info")
     if tract_data and tract_data.get("tract"):
@@ -1472,7 +1634,10 @@ def _render_census_tract_lookup() -> None:
         ).add_to(m)
         st_folium(m, height=350, use_container_width=True)
     elif tract_data and tract_data.get("tract") is None:
-        st.warning("Census Geocoder returned no result for the building centroid coordinates.")
+        st.warning(
+            "Census Geocoder returned no result for the building centroid coordinates. "
+            + _census_crs_troubleshoot_hint()
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2067,6 +2232,20 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 propensity_engine.tract_distributions.update(td)
         propensity_result = propensity_engine.calculate_all_probabilities()
         st.session_state["propensity_result"] = propensity_result
+        from app.analysis.census_lookup import normalize_tract_distribution_dict_keys
+
+        st.session_state["tract_distributions"] = normalize_tract_distribution_dict_keys(
+            {
+                str(k): {
+                    "education": np.asarray(v["education"], dtype=float).tolist(),
+                    "income": np.asarray(v["income"], dtype=float).tolist(),
+                    "household_size": np.asarray(v["household_size"], dtype=float).tolist(),
+                    "county": str(v.get("county", "") or ""),
+                }
+                for k, v in propensity_engine.tract_distributions.items()
+            }
+        )
+        st.session_state["county_fips_map"] = dict(propensity_engine.county_fips_map)
     except Exception as exc:
         st.error(f"Propensity model failed: {exc}")
         return
@@ -2416,10 +2595,19 @@ def _add_scenario_traces(
 
 # ── Figure builders ────────────────────────────────────────────────────────────
 
-def _build_adoption_fig(scenario_results: dict, simulated_years: list[int]) -> go.Figure:
+def _build_adoption_fig(
+    scenario_results: dict,
+    simulated_years: list[int],
+    policy_impacts: pd.DataFrame | None = None,
+) -> go.Figure:
     fig = go.Figure()
     for i, (name, res) in enumerate(scenario_results.items()):
-        ys = res["uptake"].yearly_summary.sort_values("year")
+        ys_raw = res["uptake"].yearly_summary.sort_values("year")
+        ys = (
+            prepare_yearly_summary_for_charts(ys_raw, policy_impacts)
+            if policy_impacts is not None
+            else ys_raw
+        )
         if ys.empty:
             continue
         line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
@@ -2518,14 +2706,166 @@ def _first_em(scenario_results: dict) -> pd.DataFrame:
     )
 
 
-def _sum_portfolio_retrofit_and_incentive(inc_data: pd.DataFrame) -> tuple[float | None, float | None]:
-    """(total_gross_upfront_usd, total_expected_incentive_usd) or (None, None) if not available."""
-    if inc_data.empty or "gross_upfront_usd" not in inc_data.columns:
-        return None, None
-    g = float(inc_data["gross_upfront_usd"].fillna(0.0).sum())
-    ecol = inc_data.get("expected_incentive_usd")
-    s = float(ecol.fillna(0.0).sum()) if ecol is not None else 0.0
-    return g, s
+def _tract_distributions_for_policy(policy_df: pd.DataFrame) -> tuple[dict, dict]:
+    td: dict = dict(st.session_state.get("tract_distributions") or {})
+    cfmap: dict = dict(st.session_state.get("county_fips_map") or {})
+    if not td:
+        from app.analysis.census_lookup import (
+            normalize_tract_distribution_dict_keys,
+            tract_distributions_from_enriched,
+        )
+
+        reb = tract_distributions_from_enriched(policy_df, cfmap if cfmap else None)
+        if reb:
+            td = normalize_tract_distribution_dict_keys(
+                {
+                    str(k): {
+                        "education": np.asarray(v["education"], dtype=float).tolist(),
+                        "income": np.asarray(v["income"], dtype=float).tolist(),
+                        "household_size": np.asarray(v["household_size"], dtype=float).tolist(),
+                        "county": str(v.get("county", "") or ""),
+                    }
+                    for k, v in reb.items()
+                }
+            )
+    return td, cfmap
+
+
+def _fig_income_portfolio_distribution(profile_d: dict, title: str) -> go.Figure:
+    labels = profile_d.get("labels") or []
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            name="Portfolio share (%)",
+            x=labels,
+            y=profile_d.get("portfolio_pct") or [],
+            marker_color="#94a3b8",
+        )
+    )
+    fig.update_layout(
+        title=dict(text=title, x=0.5, xanchor="center"),
+        xaxis_title="Household income (sampled bin)",
+        yaxis=dict(title="Portfolio share (%)", tickformat=".1f", rangemode="tozero", range=[0, 100]),
+        height=420,
+        margin=dict(t=56, b=120, l=56, r=40),
+        showlegend=False,
+    )
+    fig.update_xaxes(tickangle=45, automargin=True)
+    return fig
+
+
+def _fig_income_adoption_stack(profile_d: dict, title: str) -> go.Figure:
+    labels = profile_d.get("labels") or []
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            name="Adopted (no-incentive top n)",
+            x=labels,
+            y=profile_d.get("pct_adopt_base") or [],
+            marker_color="#2563eb",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            name="Additional (incentive lift, eligible tiers)",
+            x=labels,
+            y=profile_d.get("pct_adopt_lift") or [],
+            marker_color="#15803d",
+        )
+    )
+    fig.add_trace(
+        go.Bar(
+            name="Did not adopt (at this n)",
+            x=labels,
+            y=profile_d.get("pct_stack_remainder") or [],
+            marker_color="#e2e8f0",
+        )
+    )
+    fig.update_layout(
+        title=dict(text=title, x=0.5, xanchor="center"),
+        barmode="stack",
+        xaxis_title="Household income (sampled bin)",
+        yaxis=dict(title="Within-bin share (%)", tickformat=".1f", range=[0, 100]),
+        height=460,
+        margin=dict(t=56, b=132, l=56, r=40),
+        legend=dict(orientation="h", yanchor="top", y=-0.36, xanchor="center", x=0.5),
+    )
+    fig.update_xaxes(tickangle=45, automargin=True)
+    return fig
+
+
+def _render_no_incentive_income_adoption_charts(
+    policy_impacts: pd.DataFrame,
+    scenario_results: dict,
+    retrofit_name: str,
+) -> None:
+    if "acceptance_probability" not in policy_impacts.columns:
+        return
+    r_label = resolve_retrofit_scenario_name(policy_impacts, retrofit_name)
+    keys_i = [str(k) for k in scenario_results.keys()]
+    if not keys_i:
+        return
+    st.markdown("### Income distribution & adoption (no incentive)")
+    st.caption(
+        "Choose an **adoption scenario** first. Charts are in the section below (collapsed by default)."
+    )
+    default_chart = pick_adoption_scenario_for_cohort_breakdown(keys_i, scenario_results, r_label)
+    _chart_state_key = "adopt_income_detail_scenario_no_inc"
+    if _chart_state_key not in st.session_state or st.session_state[_chart_state_key] not in keys_i:
+        st.session_state[_chart_state_key] = default_chart if default_chart in keys_i else keys_i[0]
+    n_by_scen: dict[str, int] = {}
+    for k in keys_i:
+        ys = scenario_results[k]["uptake"].yearly_summary
+        row = last_year_uptake_row(ys, k, r_label)
+        n_by_scen[k] = n_adopters_from_yearly_row(row) if row is not None else 0
+    detail_scen = st.selectbox(
+        "Adoption scenario for detail charts",
+        options=keys_i,
+        key=_chart_state_key,
+        format_func=lambda k: f"{k} (n={n_by_scen.get(str(k), 0):,} adopters)",
+    )
+    n_cmp = int(n_by_scen[str(detail_scen)])
+    _chart_key = str(detail_scen).replace(" ", "_")[:48]
+    with st.expander("Income & adoption by bin", expanded=False):
+        st.caption("Charts use the **adoption scenario** selected above.")
+        td, cfmap = _tract_distributions_for_policy(policy_impacts)
+        policy_demo = fill_missing_demographic_probs(
+            policy_impacts, td if td else None, cfmap if cfmap else None
+        )
+        n_take = min(n_cmp, len(policy_demo)) if n_cmp > 0 else 0
+        if n_take <= 0:
+            st.info("Select an adoption scenario with positive final-year adopters to chart income bins.")
+        else:
+            profile = build_income_portfolio_adoption_profile(
+                policy_demo,
+                policy_demo,
+                "acceptance_probability",
+                n_take,
+                {},
+            )
+            labels = profile.get("labels") or []
+            if not labels:
+                st.caption(
+                    "No income breakdown (missing tract demographics; re-run with tract/geoid on buildings)."
+                )
+            else:
+                n_rk = int(profile.get("n_rank_compare", 0))
+                st.plotly_chart(
+                    _fig_income_portfolio_distribution(
+                        profile,
+                        "Portfolio share by income bin — %s" % detail_scen,
+                    ),
+                    use_container_width=True,
+                    key="income_port_no_inc_%s" % _chart_key,
+                )
+                st.plotly_chart(
+                    _fig_income_adoption_stack(
+                        profile,
+                        "Within-bin adoption at top n — %s (n=%d)" % (detail_scen, n_rk),
+                    ),
+                    use_container_width=True,
+                    key="income_stack_no_inc_%s" % _chart_key,
+                )
 
 
 def _render_adoption_incentive_breakdown(
@@ -2539,7 +2879,7 @@ def _render_adoption_incentive_breakdown(
     *,
     precomputed: tuple[pd.DataFrame, str] | None = None,
 ) -> None:
-    """Cohort by income/education; ranking displacement and incentive on adopted."""
+    """Adoption finance table + income portfolio / within-bin adoption chart (incentive sense check)."""
     if (
         "acceptance_probability" not in policy_base.columns
         or "acceptance_probability" not in policy_inc.columns
@@ -2565,16 +2905,8 @@ def _render_adoption_incentive_breakdown(
         return
     keys_i = tbl["adoption_scenario"].astype(str).tolist()
     rows = tbl.to_dict("records")
-    tot_s = _sum_portfolio_retrofit_and_incentive(prop_inc.data)[1]
 
     st.markdown("### Adoption cohort & incentive lift")
-    st.caption(
-        f"**Retrofit label:** “{r_label}”. One row per **adoption curve** ({len(keys_i)} scenario(s)). "
-        "Adopters = final-year mean uptake × **n_buildings**. "
-        "**Incentives given** = adopters with **expected_incentive_usd** > 0. "
-        "**Gross cost** / **expected $** columns sum **gross_upfront_usd** and all **expected_incentive_usd** on the adopted cohort (not the full stock). "
-        "Demographic charts below use the scenario you select."
-    )
     with st.expander("Definition & formula — adoption cohort & incentive lift", expanded=False):
         st.markdown(_FORMULA_MD_ADOPTION_DEMO_BREAKDOWN)
 
@@ -2636,91 +2968,107 @@ def _render_adoption_incentive_breakdown(
         hide_index=True,
     )
 
-    inc_vals = tbl["cohort_expected_incentive_usd"].astype(float)
-    gross_vals = tbl["cohort_gross_cost_usd"].astype(float)
-    pos_vals = tbl["n_positive_incentive"].astype(int)
-    adop_inc = tbl["n_adopters_with_inc"].astype(int)
-    if len(keys_i) > 1:
-        st.caption(
-            f"**Across scenarios:** gross cost on cohort **${gross_vals.min():,.0f} – ${gross_vals.max():,.0f}**; "
-            f"expected incentive on cohort **${inc_vals.min():,.0f} – ${inc_vals.max():,.0f}**; "
-            f"incentives given (count) **{pos_vals.min():,} – {pos_vals.max():,}**; "
-            f"adopters (w/ incentive) **{adop_inc.min():,} – {adop_inc.max():,}**."
-        )
-    if tot_s is not None and tot_s > 0 and inc_vals.max() > 0:
-        st.caption(
-            f"Portfolio-wide expected incentive pool (all buildings, not adoption-weighted): **${tot_s:,.0f}**. "
-            "Cohort column is only the adopted subset."
-        )
-
+    st.caption(
+        "Choose an **adoption scenario** first. Distribution charts live in the sections below (collapsed by default)."
+    )
     default_chart = pick_adoption_scenario_for_cohort_breakdown(keys_i, scenario_results, r_label)
     _chart_state_key = "adopt_demo_detail_scenario"
     if _chart_state_key not in st.session_state or st.session_state[_chart_state_key] not in keys_i:
         st.session_state[_chart_state_key] = default_chart if default_chart in keys_i else keys_i[0]
     n_by_scen = dict(zip(tbl["adoption_scenario"].astype(str), tbl["n_adopters_with_inc"].astype(int)))
     detail_scen = st.selectbox(
-        "Income / education charts for adoption scenario",
+        "Adoption scenario for detail charts",
         options=keys_i,
         key=_chart_state_key,
         format_func=lambda k: f"{k} (n={n_by_scen.get(str(k), 0):,} adopters)",
     )
     n_i = int(n_by_scen[str(detail_scen)])
-    cohort = build_adoption_cohort_by_demographics(
-        policy_inc, "acceptance_probability", n_i
-    )
-    inc_cohort_usd = float(tbl.loc[tbl["adoption_scenario"].eq(detail_scen), "cohort_expected_incentive_usd"].iloc[0])
-    if tot_s is not None and tot_s > 0 and inc_cohort_usd > 0:
-        st.caption(
-            f"**{detail_scen}** — expected incentives on adopted cohort: **${inc_cohort_usd:,.0f}** "
-            f"({100.0 * inc_cohort_usd / tot_s:.1f}% of portfolio pool)."
-        )
+    _chart_key = str(detail_scen).replace(" ", "_")[:48]
 
-    in_counts = cohort["income_counts"]
-    ed_counts = cohort["education_counts"]
-    c1, c2 = st.columns(2)
-    with c1:
-        if in_counts:
-            s_inc = pd.Series(in_counts).sort_index()
-            fig = go.Figure(
-                go.Bar(
-                    x=s_inc.index,
-                    y=s_inc.values,
-                    marker_color="#16a34a",
-                    name="Buildings",
-                )
+    with st.expander("Retrofit cost distribution (histogram)", expanded=False):
+        with st.expander("Definition — per-building retrofit cost", expanded=False):
+            st.markdown(
+                "Per-building **total retrofit cost** uses **`gross_upfront_usd`** when present and positive, "
+                "else **`adjusted_net_cost.AllCustomers`**, **`net_cost.AllCustomers`**, or **`cost.Total`** (USD). "
+                "Use **histogram bins** below to change how costs are grouped along the x-axis."
             )
-            fig.update_layout(
-                title="Adopted cohort by income — %s (n=%d)" % (detail_scen, n_i),
-                xaxis_title="",
-                yaxis_title="Buildings",
-                height=400,
-                margin=dict(t=40, b=80),
+        cost_s, cost_src = retrofit_cost_column_for_policy(policy_inc)
+        if cost_src and float(pd.to_numeric(cost_s, errors="coerce").fillna(0.0).max()) > 0:
+            st.caption("Cost column: `%s` (USD per building)." % cost_src)
+            n_cost_bins = st.slider(
+                "Histogram bins (cost)",
+                min_value=5,
+                max_value=100,
+                value=40,
+                step=1,
+                help="More bins = finer USD intervals; fewer = wider buckets.",
+                key="retrofit_cost_hist_nbins",
             )
-            fig.update_xaxes(tickangle=45)
-            st.plotly_chart(fig, use_container_width=True, key="adopt_demo_income")
+            st.plotly_chart(
+                go.Figure(
+                    data=[
+                        go.Histogram(
+                            x=cost_s,
+                            nbinsx=int(n_cost_bins),
+                            name="Buildings",
+                        )
+                    ],
+                    layout=dict(
+                        title="Distribution of total retrofit cost (all buildings)",
+                        xaxis_title="USD",
+                        yaxis_title="Count",
+                        template="plotly_white",
+                        bargap=0.05,
+                    ),
+                ),
+                use_container_width=True,
+                key="retrofit_cost_hist_%s_%d" % (_chart_key, int(n_cost_bins)),
+            )
         else:
-            st.caption("No income breakdown (missing tract `income_probs` on policy impacts).")
-    with c2:
-        if ed_counts:
-            s_ed = pd.Series(ed_counts).sort_index()
-            fig2 = go.Figure(
-                go.Bar(
-                    x=s_ed.index,
-                    y=s_ed.values,
-                    marker_color="#2563eb",
-                )
+            st.caption(
+                "No per-building retrofit cost on incentive policy impacts "
+                "(add gross_upfront_usd, net_cost.AllCustomers, or cost.Total)."
             )
-            fig2.update_layout(
-                title="Adopted cohort by education — %s (n=%d)" % (detail_scen, n_i),
-                xaxis_title="",
-                yaxis_title="Buildings",
-                height=400,
-                margin=dict(t=40, b=80),
+
+    with st.expander("Income & adoption splits (incentive vs baseline)", expanded=False):
+        st.caption(
+            "Charts use the **adoption scenario** selected above (top *n* matches that curve’s cohort)."
+        )
+        td, cfmap = _tract_distributions_for_policy(policy_inc)
+        policy_inc_demo = fill_missing_demographic_probs(
+            policy_inc, td if td else None, cfmap if cfmap else None
+        )
+        n_cmp = min(n_i, len(policy_inc_demo), len(policy_base))
+        inc_map = _build_income_incentive_map()
+        profile = build_income_portfolio_adoption_profile(
+            policy_inc_demo,
+            policy_base,
+            "acceptance_probability",
+            n_cmp,
+            inc_map,
+        )
+        labels = profile.get("labels") or []
+        if not labels:
+            st.caption(
+                "No income breakdown (missing tract demographics; re-run with tract/geoid on buildings)."
             )
-            fig2.update_xaxes(tickangle=35)
-            st.plotly_chart(fig2, use_container_width=True, key="adopt_demo_edu")
         else:
-            st.caption("No education breakdown (missing `education_probs`).")
+            st.plotly_chart(
+                _fig_income_portfolio_distribution(
+                    profile,
+                    "Portfolio share by income bin — %s" % detail_scen,
+                ),
+                use_container_width=True,
+                key="adopt_income_port_%s" % _chart_key,
+            )
+            st.plotly_chart(
+                _fig_income_adoption_stack(
+                    profile,
+                    "Within-bin adoption at top n — %s (with-inc. adopters n=%d)" % (detail_scen, n_i),
+                ),
+                use_container_width=True,
+                key="adopt_income_stack_%s" % _chart_key,
+            )
 
 
 # ── Results charts ─────────────────────────────────────────────────────────────
@@ -2798,41 +3146,47 @@ def _render_result_charts() -> None:
         st.dataframe(pd.DataFrame(summary_rows).set_index("Adoption scenario"),
                      use_container_width=True)
 
-    # adoption cohort & incentive lift (table + demographics) — re-enable when ready to ship
-    # adoption_finance_precomputed = None
-    # if (
-    #     incentives_enabled
-    #     and st.session_state.get("policy_impacts_incentive") is not None
-    #     and propensity_result_inc
-    #     and scenario_results_inc
-    # ):
-    #     _af_tbl, _af_rl = build_adoption_finance_breakdown_dataframe(
-    #         policy_impacts,
-    #         st.session_state["policy_impacts_incentive"],
-    #         propensity_result_inc.data,
-    #         scenario_results,
-    #         scenario_results_inc,
-    #         retrofit_name,
-    #     )
-    #     if _af_tbl is not None and not _af_tbl.empty:
-    #         adoption_finance_precomputed = (_af_tbl, _af_rl)
-    # if (
-    #     incentives_enabled
-    #     and st.session_state.get("policy_impacts_incentive") is not None
-    #     and propensity_result_inc
-    #     and scenario_results_inc
-    # ):
-    #     st.divider()
-    #     _render_adoption_incentive_breakdown(
-    #         policy_base=policy_impacts,
-    #         policy_inc=st.session_state["policy_impacts_incentive"],
-    #         prop_base=propensity_result,
-    #         prop_inc=propensity_result_inc,
-    #         scenario_results=scenario_results,
-    #         scenario_results_inc=scenario_results_inc,
-    #         retrofit_name=retrofit_name,
-    #         precomputed=adoption_finance_precomputed,
-    #     )
+    adoption_finance_precomputed = None
+    if (
+        incentives_enabled
+        and st.session_state.get("policy_impacts_incentive") is not None
+        and propensity_result_inc
+        and scenario_results_inc
+    ):
+        _af_tbl, _af_rl = build_adoption_finance_breakdown_dataframe(
+            policy_impacts,
+            st.session_state["policy_impacts_incentive"],
+            propensity_result_inc.data,
+            scenario_results,
+            scenario_results_inc,
+            retrofit_name,
+        )
+        if _af_tbl is not None and not _af_tbl.empty:
+            adoption_finance_precomputed = (_af_tbl, _af_rl)
+    if (
+        incentives_enabled
+        and st.session_state.get("policy_impacts_incentive") is not None
+        and propensity_result_inc
+        and scenario_results_inc
+    ):
+        st.divider()
+        _render_adoption_incentive_breakdown(
+            policy_base=policy_impacts,
+            policy_inc=st.session_state["policy_impacts_incentive"],
+            prop_base=propensity_result,
+            prop_inc=propensity_result_inc,
+            scenario_results=scenario_results,
+            scenario_results_inc=scenario_results_inc,
+            retrofit_name=retrofit_name,
+            precomputed=adoption_finance_precomputed,
+        )
+    elif scenario_results:
+        st.divider()
+        _render_no_incentive_income_adoption_charts(
+            policy_impacts,
+            scenario_results,
+            retrofit_name,
+        )
 
     st.divider()
 
@@ -2844,15 +3198,27 @@ def _render_result_charts() -> None:
         col_l, col_r = st.columns(2)
         with col_l:
             st.caption("No incentive")
-            st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
-                            use_container_width=True, key="adoption_base")
+            st.plotly_chart(
+                _build_adoption_fig(scenario_results, simulated_years, policy_impacts),
+                use_container_width=True,
+                key="adoption_base",
+            )
         with col_r:
             st.caption("With incentive")
-            st.plotly_chart(_build_adoption_fig(scenario_results_inc, simulated_years),
-                            use_container_width=True, key="adoption_inc")
+            pol_inc = st.session_state.get("policy_impacts_incentive")
+            if pol_inc is None:
+                pol_inc = policy_impacts
+            st.plotly_chart(
+                _build_adoption_fig(scenario_results_inc, simulated_years, pol_inc),
+                use_container_width=True,
+                key="adoption_inc",
+            )
     else:
-        st.plotly_chart(_build_adoption_fig(scenario_results, simulated_years),
-                        use_container_width=True, key="adoption_base")
+        st.plotly_chart(
+            _build_adoption_fig(scenario_results, simulated_years, policy_impacts),
+            use_container_width=True,
+            key="adoption_base",
+        )
 
     # ── Energy usage trajectories (full width — same baseline for both) ────────
     st.divider()
@@ -4222,6 +4588,7 @@ def _render_visualize_tab() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> None:
+    _render_input_preset_manager()
     _render_config_manager()
 
     st.title("Willingness-to-Pay & Adoption Analysis")

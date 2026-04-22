@@ -8,16 +8,45 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.analysis.census_lookup import canonical_census_geoid_str
+
 # aligned with app.analysis.census_lookup.INCOME_CATEGORIES_K (16 midpoints, k$)
 INCOME_BIN_LABELS: list[str] = [
     "< $10k", "$10k–$15k", "$15k–$20k", "$20k–$25k", "$25k–$30k", "$30k–$35k", "$35k–$40k", "$40k–$45k", "$45k–$50k", "$50k–$60k", "$60k–$75k", "$75k–$100k", "$100k–$125k", "$125k–$150k", "$150k–$200k", "$200k+",
 ]
+# k$ midpoints — same order as use_cases.apply_propensity.INCOME_CATEGORIES
+INCOME_BIN_MIDPOINTS_K: tuple[float, ...] = (
+    5.0,
+    12.5,
+    17.5,
+    22.5,
+    27.5,
+    32.5,
+    37.5,
+    42.5,
+    47.5,
+    55.0,
+    67.5,
+    87.5,
+    112.5,
+    137.5,
+    175.0,
+    225.0,
+)
 EDU_BIN_LABELS: list[str] = [
     "HS or less (incl. GED)",
     "Associate / some college",
     "Bachelor's",
     "Graduate / prof. / PhD",
 ]
+
+
+def income_label_to_midpoint_k(label: str) -> float | None:
+    try:
+        i = INCOME_BIN_LABELS.index(label)
+        return INCOME_BIN_MIDPOINTS_K[i]
+    except ValueError:
+        return None
 
 
 def _stable_hash_u32(s: str) -> int:
@@ -42,6 +71,199 @@ def _sample_category_index(
     k = int(rng.choice(n_cats, p=p))
     lab = labels[k] if labels and k < len(labels) else None
     return k, lab
+
+
+def _lookup_tract_dist_by_geoid(tract_distributions: dict[str, dict], geoid_raw: object) -> dict | None:
+    c = canonical_census_geoid_str(geoid_raw)
+    if not c:
+        return None
+    if c in tract_distributions:
+        return tract_distributions[c]
+    for k, v in tract_distributions.items():
+        if canonical_census_geoid_str(k) == c:
+            return v
+    return None
+
+
+def _row_geoid_candidates(row: pd.Series) -> list[str]:
+    """Ordered unique canonical GEOIDs from common columns (11-digit tract id)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in ("geoid", "GEOID", "GEOID20", "GEOID10"):
+        if c not in row.index:
+            continue
+        g = canonical_census_geoid_str(row.get(c))
+        if len(g) == 11 and g not in seen:
+            seen.add(g)
+            out.append(g)
+    for c in ("building.tract_id", "feature.location.tract_id", "tract_id"):
+        if c not in row.index:
+            continue
+        g = canonical_census_geoid_str(row.get(c))
+        if len(g) == 11 and g not in seen:
+            seen.add(g)
+            out.append(g)
+    return out
+
+
+def resolve_row_tract_distribution(
+    row: pd.Series,
+    tract_distributions: dict[str, dict],
+    county_fips_map: dict[int, str] | None = None,
+) -> dict | None:
+    """Match engine `_sample_demographics` / `_residential_chunk` tract lookup (geoid or county+tract)."""
+    county_fips_map = county_fips_map or {}
+    if not tract_distributions:
+        return None
+    for g in _row_geoid_candidates(row):
+        hit = _lookup_tract_dist_by_geoid(tract_distributions, g)
+        if hit is not None:
+            return hit
+    county_col = next(
+        (c for c in ["building.county", "feature.location.county", "county", "county_fips"] if c in row.index),
+        None,
+    )
+    tract_col = next(
+        (c for c in ["building.tract_id", "feature.location.tract_id", "tract_id", "GEOID20", "GEOID"] if c in row.index),
+        None,
+    )
+    county = "Middlesex"
+    if county_col is not None:
+        cv = row.get(county_col)
+        if cv is not None and pd.notna(cv):
+            if county_col == "county_fips":
+                try:
+                    ck = int(float(str(cv).split(".")[0]))
+                    county = county_fips_map.get(ck) or str(cv)
+                except (TypeError, ValueError):
+                    county = str(cv)
+            else:
+                county = str(cv).strip() or county
+    tract_str = ""
+    if tract_col is not None:
+        tv = row.get(tract_col)
+        if tv is not None and pd.notna(tv):
+            tid = str(tv).strip()
+            tract_str = tid[-6:].zfill(6) if len(tid) >= 6 else tid.zfill(6)
+    expected = f"{county}_{tract_str}"
+    if expected in tract_distributions:
+        return tract_distributions[expected]
+    for k, d in tract_distributions.items():
+        if isinstance(k, str) and k.endswith(f"_{tract_str}") and str(d.get("county", "")) == county:
+            return tract_distributions[k]
+    for k, d in tract_distributions.items():
+        if str(d.get("county", "")) == county:
+            return tract_distributions[k]
+    return None
+
+
+def _pmf_vector_ok(vec: object, n: int) -> bool:
+    if vec is None or (isinstance(vec, float) and pd.isna(vec)):
+        return False
+    try:
+        a = np.asarray(vec, dtype=float).ravel()
+        return bool(a.size == n and np.isfinite(a).all() and float(a.sum()) > 0)
+    except (TypeError, ValueError):
+        return False
+
+
+def _normalize_pmf_to_list(vec: object, n: int) -> list[float] | None:
+    try:
+        a = np.asarray(vec, dtype=float).ravel()
+        if a.size != n or not np.isfinite(a).all():
+            return None
+        s = float(a.sum())
+        if s <= 0:
+            return None
+        return (a / s).tolist()
+    except (TypeError, ValueError):
+        return None
+
+
+def fill_missing_demographic_probs(
+    df: pd.DataFrame,
+    tract_distributions: dict[str, dict] | None,
+    county_fips_map: dict[int, str] | None = None,
+) -> pd.DataFrame:
+    """Ensure ``income_probs`` (16) and ``education_probs`` (4) when tract PMFs exist (e.g. census CSV path)."""
+    td = tract_distributions or {}
+    out = df.copy()
+    if "income_probs" not in out.columns:
+        out["income_probs"] = None
+    if "education_probs" not in out.columns:
+        out["education_probs"] = None
+    for idx in out.index:
+        ip = out.at[idx, "income_probs"]
+        ep = out.at[idx, "education_probs"]
+        ok_i = _pmf_vector_ok(ip, len(INCOME_BIN_LABELS))
+        ok_e = _pmf_vector_ok(ep, len(EDU_BIN_LABELS))
+        if ok_i and ok_e:
+            continue
+        if not td:
+            continue
+        dist = resolve_row_tract_distribution(out.loc[idx], td, county_fips_map)
+        if dist is None:
+            continue
+        if not ok_i:
+            inc_src = dist.get("income")
+            if inc_src is None:
+                inc_src = dist.get("income_probs")
+            inc_list = _normalize_pmf_to_list(inc_src, len(INCOME_BIN_LABELS))
+            if inc_list:
+                out.at[idx, "income_probs"] = inc_list
+        if not ok_e:
+            edu_src = dist.get("education")
+            if edu_src is None:
+                edu_src = dist.get("education_probs")
+            edu_list = _normalize_pmf_to_list(edu_src, len(EDU_BIN_LABELS))
+            if edu_list:
+                out.at[idx, "education_probs"] = edu_list
+    out = copy_demographic_probs_from_same_geoid(out)
+    return out
+
+
+def copy_demographic_probs_from_same_geoid(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy ``income_probs`` / ``education_probs`` from another row with the same canonical GEOID."""
+    out = df
+    if "income_probs" not in out.columns:
+        return out
+
+    def geoid_key_for_index(i: object) -> str:
+        row = out.loc[i]
+        cand = _row_geoid_candidates(row)
+        return cand[0] if cand else ""
+
+    template: dict[str, tuple[list[float], list[float]]] = {}
+    for idx in out.index:
+        ip = out.at[idx, "income_probs"]
+        ep = out.at[idx, "education_probs"] if "education_probs" in out.columns else None
+        if not _pmf_vector_ok(ip, len(INCOME_BIN_LABELS)):
+            continue
+        if ep is None or not _pmf_vector_ok(ep, len(EDU_BIN_LABELS)):
+            continue
+        gk = geoid_key_for_index(idx)
+        if gk and gk not in template:
+            template[gk] = (
+                [float(x) for x in np.asarray(ip, dtype=float).ravel()],
+                [float(x) for x in np.asarray(ep, dtype=float).ravel()],
+            )
+
+    for idx in out.index:
+        ip = out.at[idx, "income_probs"]
+        ep = out.at[idx, "education_probs"] if "education_probs" in out.columns else None
+        ok_i = _pmf_vector_ok(ip, len(INCOME_BIN_LABELS))
+        ok_e = _pmf_vector_ok(ep, len(EDU_BIN_LABELS))
+        if ok_i and ok_e:
+            continue
+        gk = geoid_key_for_index(idx)
+        if not gk or gk not in template:
+            continue
+        inc_t, edu_t = template[gk]
+        if not ok_i:
+            out.at[idx, "income_probs"] = inc_t
+        if not ok_e:
+            out.at[idx, "education_probs"] = edu_t
+    return out
 
 
 def propensity_ranked_positions(p_series: pd.Series, n_take: int) -> np.ndarray:
@@ -299,20 +521,29 @@ def build_adoption_cohort_by_demographics(
     p_col: str,
     n_adopt: int,
     id_col: str = "building.id",
+    *,
+    expected_incentive_by_id: pd.Series | None = None,
 ) -> dict[str, Any]:
-    """For the top n_adopt rows by p_col, count stable synthetic income / education from tract lists."""
+    """Top n_adopt by p_col: one sampled income/education label per building from tract PMFs; optional incentive split."""
     if p_col not in policy.columns or n_adopt <= 0:
         return {
             "n_adopt": 0,
             "n_rows": len(policy),
             "income_counts": {},
             "education_counts": {},
+            "income_by_incentive": None,
+            "education_by_incentive": None,
             "row_positions": np.array([], dtype=int),
         }
     pos = propensity_ranked_positions(policy[p_col], n_adopt)
     sub = policy.iloc[pos]
     inc_counts: dict[str, int] = {}
     edu_counts: dict[str, int] = {}
+    use_split = expected_incentive_by_id is not None
+    inc_pos: dict[str, int] = {}
+    inc_zero: dict[str, int] = {}
+    edu_pos: dict[str, int] = {}
+    edu_zero: dict[str, int] = {}
     for _, row in sub.iterrows():
         bid = str(row.get(id_col, ""))
         ip = row.get("income_probs")
@@ -329,13 +560,308 @@ def build_adoption_cohort_by_demographics(
             le = "Unknown (tract education)"
         inc_counts[li] = inc_counts.get(li, 0) + 1
         edu_counts[le] = edu_counts.get(le, 0) + 1
-    return {
+        if use_split:
+            amt = 0.0
+            if bid and bid in expected_incentive_by_id.index:
+                try:
+                    amt = float(expected_incentive_by_id.loc[bid])
+                except (TypeError, ValueError):
+                    amt = 0.0
+            if pd.isna(amt):
+                amt = 0.0
+            subsidized = amt > 0.0
+            if subsidized:
+                inc_pos[li] = inc_pos.get(li, 0) + 1
+                edu_pos[le] = edu_pos.get(le, 0) + 1
+            else:
+                inc_zero[li] = inc_zero.get(li, 0) + 1
+                edu_zero[le] = edu_zero.get(le, 0) + 1
+    out: dict[str, Any] = {
         "n_adopt": int(len(pos)),
         "n_rows": len(policy),
         "income_counts": inc_counts,
         "education_counts": edu_counts,
         "row_positions": pos,
     }
+    if use_split:
+        out["income_by_incentive"] = {"positive": inc_pos, "zero": inc_zero}
+        out["education_by_incentive"] = {"positive": edu_pos, "zero": edu_zero}
+    else:
+        out["income_by_incentive"] = None
+        out["education_by_incentive"] = None
+    return out
+
+
+def build_adoption_cohort_by_demographics_with_lift(
+    policy_inc: pd.DataFrame,
+    policy_base: pd.DataFrame,
+    p_col_inc: str,
+    p_col_base: str,
+    n_adopt_inc: int,
+    id_col: str = "building.id",
+) -> dict[str, Any]:
+    """Top ``n`` by with-incentive propensity vs same ``n`` by no-incentive propensity.
+
+    Let ``n = min(n_adopt_inc, len(policy_inc), len(policy_base))``. **Would adopt** = in the
+    with-incentive top-``n`` and also in the **no-incentive** top-``n`` (same cohort size, two
+    rankings). **Added** = in the with-incentive top-``n`` but not in the no-incentive top-``n``
+    (lift from cost reduction / reordering at fixed adoption count).
+
+    Using the baseline run's *total* adopters ``n_b`` for the comparison set is wrong when
+    ``n_b`` is large: top-``n_b`` by base propensity then includes almost the whole portfolio, so
+    **Added** collapses to zero.
+    """
+    if (
+        p_col_inc not in policy_inc.columns
+        or p_col_base not in policy_base.columns
+        or n_adopt_inc <= 0
+    ):
+        return {
+            "n_adopt_inc": 0,
+            "n_rank_compare": 0,
+            "income_would_adopt": {},
+            "income_added": {},
+            "education_would_adopt": {},
+            "education_added": {},
+            "income_counts": {},
+            "education_counts": {},
+            "row_positions": np.array([], dtype=int),
+        }
+    n_take = min(int(n_adopt_inc), len(policy_inc), len(policy_base))
+    base_pos = propensity_ranked_positions(policy_base[p_col_base], n_take)
+    base_ids = set(policy_base.iloc[base_pos][id_col].astype(str))
+
+    pos = propensity_ranked_positions(policy_inc[p_col_inc], n_take)
+    sub = policy_inc.iloc[pos]
+    inc_would: dict[str, int] = {}
+    inc_added: dict[str, int] = {}
+    edu_would: dict[str, int] = {}
+    edu_added: dict[str, int] = {}
+    inc_total: dict[str, int] = {}
+    edu_total: dict[str, int] = {}
+
+    for _, row in sub.iterrows():
+        bid = str(row.get(id_col, ""))
+        ip = row.get("income_probs")
+        ep = row.get("education_probs")
+        if ip is not None and not (isinstance(ip, float) and pd.isna(ip)):
+            _, li = _sample_category_index(bid, ip, len(INCOME_BIN_LABELS), INCOME_BIN_LABELS)
+        else:
+            li = "Unknown (tract income)"
+        if ep is not None and not (isinstance(ep, float) and pd.isna(ep)):
+            _, le = _sample_category_index(
+                f"{bid}_edu", ep, len(EDU_BIN_LABELS), EDU_BIN_LABELS
+            )
+        else:
+            le = "Unknown (tract education)"
+        inc_total[li] = inc_total.get(li, 0) + 1
+        edu_total[le] = edu_total.get(le, 0) + 1
+        in_base = bool(bid) and bid in base_ids
+        if in_base:
+            inc_would[li] = inc_would.get(li, 0) + 1
+            edu_would[le] = edu_would.get(le, 0) + 1
+        else:
+            inc_added[li] = inc_added.get(li, 0) + 1
+            edu_added[le] = edu_added.get(le, 0) + 1
+
+    return {
+        "n_adopt_inc": int(len(pos)),
+        "n_rank_compare": int(n_take),
+        "income_would_adopt": inc_would,
+        "income_added": inc_added,
+        "education_would_adopt": edu_would,
+        "education_added": edu_added,
+        "income_counts": inc_total,
+        "education_counts": edu_total,
+        "row_positions": pos,
+    }
+
+
+def build_income_portfolio_adoption_profile(
+    policy_inc: pd.DataFrame,
+    policy_base: pd.DataFrame,
+    p_col: str,
+    n_rank_compare: int,
+    incentive_usd_by_income_k: dict[float, float] | None,
+    id_col: str = "building.id",
+) -> dict[str, Any]:
+    """Per income bin (one sampled label per building): portfolio share and adoption rates.
+
+    - **portfolio_pct**: % of all buildings in each bin (sums to 100).
+    - **pct_adopt_base**: % of buildings in the bin that are in the top ``n_rank_compare`` by
+      no-incentive ``p_col``.
+    - **pct_adopt_lift**: % of buildings in the bin in the with-incentive top ``n_rank_compare``
+      but not the no-incentive top ``n_rank_compare``, **only counted** when the bin’s income
+      midpoint has strictly positive incentive in ``incentive_usd_by_income_k`` (Configure tab).
+    - **pct_stack_remainder**: ``100 - pct_adopt_base - pct_adopt_lift`` (did not adopt at this
+      cutoff / not attributed lift), for 100% stacked bars per bin.
+
+    **Order of operations:** rank all buildings once by **no-incentive** propensity and take
+    top ``n`` → **base adopters** per sampled income bin. Then rank by **with-incentive**
+    propensity and take top ``n``; buildings that enter this set but not the base set **and**
+    whose bin has Configure incentive ``> 0`` → **lift** segment. Remainder did not rank in
+    the base top ``n`` and are not counted as policy lift (including ineligible tiers).
+    """
+    inc_map = incentive_usd_by_income_k or {}
+    out_empty: dict[str, Any] = {
+        "labels": [],
+        "n_portfolio": 0,
+        "n_rank_compare": 0,
+        "count_in_bin": [],
+        "portfolio_pct": [],
+        "pct_adopt_base": [],
+        "pct_adopt_lift": [],
+        "pct_stack_remainder": [],
+        "tier_has_incentive": [],
+    }
+    if (
+        p_col not in policy_inc.columns
+        or p_col not in policy_base.columns
+        or n_rank_compare <= 0
+        or policy_inc.empty
+    ):
+        return out_empty
+    n_take = min(int(n_rank_compare), len(policy_inc), len(policy_base))
+    if n_take <= 0:
+        return out_empty
+
+    base_pos = propensity_ranked_positions(policy_base[p_col], n_take)
+    inc_pos = propensity_ranked_positions(policy_inc[p_col], n_take)
+    base_ids = set(policy_base.iloc[base_pos][id_col].astype(str))
+    inc_ids = set(policy_inc.iloc[inc_pos][id_col].astype(str))
+
+    n_bin: dict[str, int] = {}
+    adopt_b: dict[str, int] = {}
+    lift_elig: dict[str, int] = {}
+
+    for _, row in policy_inc.iterrows():
+        bid = str(row.get(id_col, ""))
+        ip = row.get("income_probs")
+        if ip is not None and not (isinstance(ip, float) and pd.isna(ip)):
+            _, li = _sample_category_index(bid, ip, len(INCOME_BIN_LABELS), INCOME_BIN_LABELS)
+        else:
+            li = "Unknown (tract income)"
+        n_bin[li] = n_bin.get(li, 0) + 1
+        if bid and bid in base_ids:
+            adopt_b[li] = adopt_b.get(li, 0) + 1
+        if bid and bid in inc_ids and bid not in base_ids:
+            mid = income_label_to_midpoint_k(li)
+            if mid is not None and float(inc_map.get(mid, 0.0)) > 0.0:
+                lift_elig[li] = lift_elig.get(li, 0) + 1
+
+    labels = [c for c in INCOME_BIN_LABELS if n_bin.get(c, 0) > 0] + sorted(
+        k for k in n_bin if k not in INCOME_BIN_LABELS
+    )
+    n_tot = int(sum(n_bin.values()))
+    count_in_bin = [n_bin[l] for l in labels]
+    port_pct = [100.0 * c / n_tot for c in count_in_bin] if n_tot else []
+    pct_b = [100.0 * adopt_b.get(l, 0) / n_bin[l] if n_bin[l] else 0.0 for l in labels]
+    pct_lift = [100.0 * lift_elig.get(l, 0) / n_bin[l] if n_bin[l] else 0.0 for l in labels]
+    pct_rem = [
+        max(0.0, 100.0 - pct_b[i] - pct_lift[i]) for i in range(len(labels))
+    ]
+    tier_inc = []
+    for l in labels:
+        mid = income_label_to_midpoint_k(l)
+        tier_inc.append(
+            bool(mid is not None and float(inc_map.get(mid, 0.0)) > 0.0)
+        )
+
+    return {
+        "labels": labels,
+        "n_portfolio": n_tot,
+        "n_rank_compare": int(n_take),
+        "count_in_bin": count_in_bin,
+        "portfolio_pct": port_pct,
+        "pct_adopt_base": pct_b,
+        "pct_adopt_lift": pct_lift,
+        "pct_stack_remainder": pct_rem,
+        "tier_has_incentive": tier_inc,
+    }
+
+
+def retrofit_cost_column_for_policy(policy: pd.DataFrame) -> tuple[pd.Series, str]:
+    """Per-row total retrofit deal cost (USD) and which column was used."""
+    if "gross_upfront_usd" in policy.columns:
+        s = pd.to_numeric(policy["gross_upfront_usd"], errors="coerce").fillna(0.0)
+        if float(s.sum()) > 0 or float(s.max()) > 0:
+            return s, "gross_upfront_usd"
+    for k in ("adjusted_net_cost.AllCustomers", "net_cost.AllCustomers", "cost.Total"):
+        if k in policy.columns:
+            s = pd.to_numeric(policy[k], errors="coerce").fillna(0.0)
+            return s, k
+    return pd.Series(0.0, index=policy.index), ""
+
+
+def build_retrofit_cost_bucket_incentive_table(
+    policy_inc: pd.DataFrame,
+    *,
+    n_adopters: int,
+    p_col: str = "acceptance_probability",
+    incentive_col: str = "expected_incentive_usd",
+    n_bins: int = 10,
+) -> pd.DataFrame:
+    """Quantile buckets of retrofit cost: building counts, % adopted (top n by propensity), % with adopt + incentive > 0.
+
+    Adopters match the finance / energy model: top ``n_adopters`` rows by ``p_col``.
+    """
+    empty = pd.DataFrame(
+        columns=[
+            "cost_bucket",
+            "n_buildings",
+            "n_adopted",
+            "pct_adopted",
+            "n_incentivized_adopters",
+            "pct_incentivized_adopters_in_bucket",
+        ]
+    )
+    if policy_inc.empty or n_adopters <= 0 or p_col not in policy_inc.columns:
+        return empty
+    cost, _src = retrofit_cost_column_for_policy(policy_inc)
+    if float(cost.max()) <= 0:
+        return empty
+
+    pos = propensity_ranked_positions(policy_inc[p_col], n_adopters)
+    adopted = np.zeros(len(policy_inc), dtype=bool)
+    adopted[pos] = True
+
+    inc = (
+        pd.to_numeric(policy_inc[incentive_col], errors="coerce").fillna(0.0)
+        if incentive_col in policy_inc.columns
+        else pd.Series(0.0, index=policy_inc.index)
+    )
+    incent_adopt = adopted & (inc > 0)
+
+    nq = max(1, min(int(n_bins), len(policy_inc)))
+    try:
+        bucket = pd.qcut(cost, q=nq, duplicates="drop")
+    except (ValueError, TypeError):
+        bucket = pd.Series(["all"] * len(policy_inc), index=policy_inc.index, dtype=object)
+
+    df = pd.DataFrame(
+        {
+            "cost_bucket": bucket.astype(str),
+            "adopted": adopted,
+            "incentivized_adopter": incent_adopt,
+        }
+    )
+    g = df.groupby("cost_bucket", sort=True, observed=False)
+    out = g.agg(
+        n_buildings=("adopted", "count"),
+        n_adopted=("adopted", "sum"),
+        n_incentivized_adopters=("incentivized_adopter", "sum"),
+    ).reset_index()
+    out["pct_adopted"] = np.where(
+        out["n_buildings"] > 0,
+        100.0 * out["n_adopted"].astype(float) / out["n_buildings"].astype(float),
+        0.0,
+    )
+    out["pct_incentivized_adopters_in_bucket"] = np.where(
+        out["n_buildings"] > 0,
+        100.0 * out["n_incentivized_adopters"].astype(float) / out["n_buildings"].astype(float),
+        0.0,
+    )
+    return out
 
 
 def _adopted_building_ids_by_propensity(

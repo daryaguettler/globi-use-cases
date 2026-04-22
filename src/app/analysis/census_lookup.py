@@ -39,6 +39,37 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent.parent
 
 
+def canonical_census_geoid_str(val: object) -> str:
+    """Normalize tract GEOID for dict lookup (fixes float serialization e.g. 25017300100.0)."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    if isinstance(val, (int, np.integer)):
+        return str(int(val))
+    s = str(val).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    try:
+        x = float(s)
+        if np.isfinite(x) and x >= 1e10:
+            return str(int(round(x)))
+    except (TypeError, ValueError):
+        pass
+    if s.endswith(".0") and len(s) > 2 and s[:-2].isdigit():
+        return s[:-2]
+    return s
+
+
+def normalize_tract_distribution_dict_keys(tract_distributions: dict) -> dict[str, Any]:
+    """Use canonical 11-digit GEOID keys where applicable; keep keys like ``County_tract`` unchanged."""
+    out: dict[str, Any] = {}
+    for k, v in tract_distributions.items():
+        ks = str(k).strip()
+        c = canonical_census_geoid_str(ks)
+        nk = c if c and len(c) == 11 else ks
+        out[nk] = v
+    return out
+
+
 def census_cache_dir() -> Path:
     """Directory for persisted geocoder + ACS responses (``outputs/census_cache``)."""
     override = os.environ.get("GLOBI_CENSUS_CACHE_DIR", "").strip()
@@ -663,7 +694,7 @@ def tract_distributions_from_enriched(
     sub = sub.drop_duplicates(subset=["geoid"], keep="first")
     out: dict[str, dict[str, Any]] = {}
     for _, row in sub.iterrows():
-        gid = str(row["geoid"]).strip()
+        gid = canonical_census_geoid_str(row["geoid"])
         if not gid:
             continue
         inc = row.get("income_probs")

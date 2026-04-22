@@ -121,6 +121,91 @@ def compute_building_annual_emissions(
     return total
 
 
+# ── Yearly uptake alignment (policy retrofit vs uptake rows) ───────────────────
+
+
+def _yearly_rows_for_year_and_policy(
+    yearly_summary: pd.DataFrame,
+    policy_impacts: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Rows for *year*, restricted to the policy table's retrofit label when unambiguous."""
+    yr = yearly_summary[yearly_summary["year"] == year]
+    if yr.empty:
+        return yr
+    if (
+        "retrofit.scenario" in yr.columns
+        and "retrofit.scenario" in policy_impacts.columns
+    ):
+        u = policy_impacts["retrofit.scenario"].dropna().unique()
+        if len(u) == 1:
+            yr = yr[yr["retrofit.scenario"] == u[0]]
+    return yr
+
+
+def adoption_pct_triplet_from_yearly_rows(year_rows: pd.DataFrame) -> tuple[float, float, float]:
+    """Mean / p10 / p90 cumulative adoption % for one calendar year (handles multiple retrofit slices)."""
+    if year_rows.empty:
+        return 0.0, 0.0, 0.0
+    if len(year_rows) == 1:
+        r = year_rows.iloc[0]
+        m = float(r.get("cumulative_adoption_pct", 0.0))
+        p10 = float(r.get("cumulative_adoption_pct_p10", m))
+        p90 = float(r.get("cumulative_adoption_pct_p90", m))
+        return m, p10, p90
+    w = year_rows["n_buildings"].astype(float).values
+    den = float(w.sum())
+    if den <= 0:
+        r = year_rows.iloc[0]
+        m = float(r.get("cumulative_adoption_pct", 0.0))
+        return m, m, m
+
+    def wavg(col: str, default: float) -> float:
+        if col not in year_rows.columns:
+            return default
+        return float((year_rows[col].astype(float).values * w).sum() / den)
+
+    m = wavg("cumulative_adoption_pct", 0.0)
+    p10 = wavg("cumulative_adoption_pct_p10", m)
+    p90 = wavg("cumulative_adoption_pct_p90", m)
+    return m, p10, p90
+
+
+def prepare_yearly_summary_for_charts(
+    yearly_summary: pd.DataFrame,
+    policy_impacts: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """Collapse to one row per year for Plotly (match policy retrofit; n-weighted merge)."""
+    if yearly_summary.empty:
+        return yearly_summary
+    ys = yearly_summary
+    if policy_impacts is not None and "retrofit.scenario" in ys.columns and "retrofit.scenario" in policy_impacts.columns:
+        u = policy_impacts["retrofit.scenario"].dropna().unique()
+        if len(u) == 1:
+            ys = ys[ys["retrofit.scenario"] == u[0]].copy()
+    if ys.empty:
+        return ys
+    if not ys["year"].duplicated().any():
+        return ys.sort_values("year")
+    out_rows: list[dict] = []
+    for year, grp in ys.groupby("year", sort=True):
+        m, p10, p90 = adoption_pct_triplet_from_yearly_rows(grp)
+        nb = float(grp["n_buildings"].astype(float).sum()) if "n_buildings" in grp.columns else float(len(grp))
+        row = {
+            "year": int(year),
+            "cumulative_adoption_pct": m,
+            "cumulative_adoption_pct_p10": p10,
+            "cumulative_adoption_pct_p90": p90,
+            "n_buildings": nb,
+        }
+        if "retrofit.scenario" in grp.columns:
+            row["retrofit.scenario"] = grp["retrofit.scenario"].iloc[0]
+        if "adoption_scenario" in grp.columns:
+            row["adoption_scenario"] = grp["adoption_scenario"].iloc[0]
+        out_rows.append(row)
+    return pd.DataFrame(out_rows)
+
+
 # ── Main trajectory calculation ────────────────────────────────────────────────
 
 def interpolate_building_energy(
@@ -239,14 +324,8 @@ def compute_emissions_trajectory(
         total_baseline_kg = float(base_em.sum())
         total_baseline_kwh = float(base_kwh_per_bldg.sum())
 
-        year_rows = yearly_summary[yearly_summary["year"] == year]
-        if year_rows.empty:
-            mean_pct = p10_pct = p90_pct = 0.0
-        else:
-            r = year_rows.iloc[0]
-            mean_pct = float(r.get("cumulative_adoption_pct", 0.0))
-            p10_pct = float(r.get("cumulative_adoption_pct_p10", mean_pct))
-            p90_pct = float(r.get("cumulative_adoption_pct_p90", mean_pct))
+        year_rows = _yearly_rows_for_year_and_policy(yearly_summary, policy_impacts, year)
+        mean_pct, p10_pct, p90_pct = adoption_pct_triplet_from_yearly_rows(year_rows)
 
         def _stock_metric(
             adopted_frac: float,
