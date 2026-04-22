@@ -25,6 +25,8 @@ Output columns added
 - ``propensity_min/max/mean/sd``          Monte Carlo statistics (residential only)
 - ``acceptance_probability_min/max/mean`` aliases for the MC stats
 - ``acceptance_probability_li/moderate/non_lmi`` cohort-level estimates at fixed incomes
+- ``gross_upfront_usd``                    upfront retrofit **deal** cost in USD (same cost column as the WTP logit, before any income-based incentive in MC)
+- ``expected_incentive_usd``            residential only, mean incentive USD across propensity income draws; 0 for commercial; 0 if incentives disabled
 
 Example usage::
 
@@ -50,6 +52,19 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
+
+# what each headline mean refers to (UI, JSON metadata, exports)
+MEAN_ACCEPTANCE_AGGREGATE_LABEL = "Mean acceptance (avg. over buildings)"
+MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION = (
+    "Mean of acceptance_probability over all output rows (equal weight per row). "
+    "Each row's value is from propensity only: residential rows average the logit over "
+    "propensity Monte Carlo draws; commercial rows use the NPV rule. "
+    "Adoption curves and uptake dice rolls do not affect this column."
+)
+MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION = (
+    "Mean of acceptance_probability over rows in this retrofit.scenario. "
+    "Propensity only; not uptake dice rolls."
+)
 
 # ── Massachusetts-specific defaults ──────────────────────────────────────────
 # These are trained on MA survey data.  Pass overrides to PropensityModelEngine
@@ -118,7 +133,9 @@ class PropensityResult(BaseModel):
     data: pd.DataFrame
     n_buildings: int
     n_scenarios: int
-    mean_acceptance_probability: float
+    mean_acceptance_probability: float = Field(
+        description=MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+    )
 
 
 class PropensityModelEngine(BaseModel):
@@ -420,6 +437,16 @@ class PropensityModelEngine(BaseModel):
         z = (mc["intercept"] + mc["Year built"] * age + mc["Education"] * edu + mc["bedrooms"] * hh + mc["residents"] * hh + mc["Income"] * inc + mc["Concern"] * concern + mc["Upfront cost"] * cost + mc["Neighbor"] * neighbor + mc["Energy cost"] * savings)
         return 1 / (1 + np.exp(-z))
 
+    def _row_gross_capex_usd(self, row: pd.Series) -> float:
+        c = row.get("cost.Total", np.nan)
+        if c is not None and not pd.isna(c) and float(c) > 0:
+            return float(c)
+        for k in ("adjusted_net_cost.AllCustomers", "net_cost.AllCustomers"):
+            v = row.get(k, np.nan)
+            if v is not None and not pd.isna(v):
+                return float(v)
+        return 0.0
+
     def _calculate_commercial_npv(self, capex: float, annual_savings: float, npv_years: int | None = None, wacc: float | None = None, energy_price_growth_rate: float | None = None) -> float:
         lifetime = npv_years or self.npv_years
         rate = wacc or self.wacc
@@ -453,7 +480,8 @@ class PropensityModelEngine(BaseModel):
 
         for col in ["acceptance_probability", "propensity_min", "propensity_max", "propensity_mean", "propensity_sd",
                     "acceptance_probability_min", "acceptance_probability_max", "acceptance_probability_mean",
-                    "acceptance_probability_li", "acceptance_probability_moderate", "acceptance_probability_non_lmi"]:
+                    "acceptance_probability_li", "acceptance_probability_moderate", "acceptance_probability_non_lmi",
+                    "gross_upfront_usd", "expected_incentive_usd"]:
             self.data[col] = np.nan if "acceptance_probability" not in col else 0.0
 
         if res_mask.any():
@@ -464,7 +492,7 @@ class PropensityModelEngine(BaseModel):
         n_buildings = self.data["building.id"].nunique() if "building.id" in self.data.columns else 0
         n_scenarios = self.data["retrofit.scenario"].nunique() if "retrofit.scenario" in self.data.columns else 0
         mean_prob = float(self.data["acceptance_probability"].mean())
-        logger.info(f"Mean acceptance probability: {mean_prob:.2%}")
+        logger.info(f"{MEAN_ACCEPTANCE_AGGREGATE_LABEL}: {mean_prob:.2%}")
 
         return PropensityResult(data=self.data.copy(), n_buildings=n_buildings, n_scenarios=n_scenarios, mean_acceptance_probability=mean_prob)
 
@@ -526,6 +554,8 @@ class PropensityModelEngine(BaseModel):
         cohort_li = np.full(n, np.nan)
         cohort_mod = np.full(n, np.nan)
         cohort_non = np.full(n, np.nan)
+        exp_incentive_usd = np.zeros(n, dtype=float)
+        gross_upfront_usd = (upfront_cost * 1000.0).astype(float)
 
         # group by geoid when present and non-empty, else (county, tract)
         group_indices: dict[tuple, list[int]] = {}
@@ -565,6 +595,8 @@ class PropensityModelEngine(BaseModel):
                 incentive_lookup = {v: self.incentive_by_income.get(v, 0.0) for v in INCOME_CATEGORIES}
                 incentive_matrix = np.vectorize(incentive_lookup.__getitem__)(inc) / 1000
                 cost_input = np.maximum(cost[:, None] - incentive_matrix, 0.0)
+                # mean draw incentive, USD (same expectation as the MC column means)
+                exp_incentive_usd[idx] = (incentive_matrix.mean(axis=1) * 1000.0).astype(float)
             else:
                 cost_input = cost[:, None]
 
@@ -588,16 +620,22 @@ class PropensityModelEngine(BaseModel):
         self.data.loc[mask, "acceptance_probability_min"] = propensity_min
         self.data.loc[mask, "acceptance_probability_max"] = propensity_max
         self.data.loc[mask, "acceptance_probability_mean"] = propensity_mean
+        self.data.loc[mask, "gross_upfront_usd"] = gross_upfront_usd
+        self.data.loc[mask, "expected_incentive_usd"] = exp_incentive_usd
         if self.compute_cohort_acceptance:
             self.data.loc[mask, "acceptance_probability_li"] = cohort_li
             self.data.loc[mask, "acceptance_probability_moderate"] = cohort_mod
             self.data.loc[mask, "acceptance_probability_non_lmi"] = cohort_non
 
     def _calculate_commercial_probabilities(self, mask: pd.Series) -> None:
-        probs = self.data.loc[mask].apply(self._calculate_commercial_probability, axis=1).values
+        sub = self.data.loc[mask]
+        probs = sub.apply(self._calculate_commercial_probability, axis=1).values
+        gross = sub.apply(self._row_gross_capex_usd, axis=1).values
         for col in ["acceptance_probability", "propensity_min", "propensity_max", "propensity_mean", "acceptance_probability_min", "acceptance_probability_max", "acceptance_probability_mean"]:
             self.data.loc[mask, col] = probs
         self.data.loc[mask, "propensity_sd"] = 0.0
+        self.data.loc[mask, "gross_upfront_usd"] = gross
+        self.data.loc[mask, "expected_incentive_usd"] = 0.0
 
     # ── Export ────────────────────────────────────────────────────────────────
 
@@ -628,6 +666,8 @@ class PropensityModelEngine(BaseModel):
             "n_scenarios": result.n_scenarios,
             "total_rows": len(result.data),
             "mean_acceptance_probability": result.mean_acceptance_probability,
+            "mean_acceptance_probability_definition": MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+            "scenario_summary_mean_probability_definition": MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION,
             "model_coefficients": self.model_coefficients,
             "neighbor_effect": self.neighbor_effect,
             "n_monte_carlo_samples": self.n_monte_carlo_samples,

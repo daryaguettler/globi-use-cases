@@ -1,7 +1,7 @@
 """Willingness-to-Pay & Adoption Analysis — Streamlit Application.
 
 Workflow:
-  1. Upload Data        — Baseline + Scenario EnergyAndPeak.pq files (one per year)
+  1. Upload Data        — Baseline + scenario parquet per year (per-year upload, batch pool, or browse `data/inputs/`)
   2. Configure          — Retrofit cost, energy prices, demographics, MC settings
   3. Adoption Curves    — Select / preview adoption curve scenario
   4. Emissions          — Edit emissions factor trajectories
@@ -15,8 +15,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import random
+import re
 import sys
+import time
 import copy
 import zipfile
 from functools import reduce
@@ -48,9 +51,23 @@ from app.analysis.energy_delta import (
     build_policy_impacts,
     load_energy_parquet,
 )
+from app.analysis.adoption_breakdown import (
+    build_adoption_cohort_by_demographics,
+    count_adopters_with_positive_incentive,
+    expected_incentive_sum_on_adopted_cohort,
+    last_year_uptake_row,
+    n_adopters_from_yearly_row,
+    ranking_displacement_at_equal_n,
+    resolve_retrofit_scenario_name,
+)
 from app.analysis.emissions_calc import compute_emissions_trajectory
-from use_cases.apply_propensity import PropensityModelEngine
-from use_cases.apply_uptake import AdoptionEngine
+from use_cases.apply_propensity import (
+    MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+    MEAN_ACCEPTANCE_AGGREGATE_LABEL,
+    MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION,
+    PropensityModelEngine,
+)
+from use_cases.apply_uptake import AdoptionEngine, UptakeResult
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 _DATA_DIR = _REPO_ROOT / "data" / "inputs"
@@ -74,6 +91,209 @@ _INCOME_TIERS: list[tuple[str, list[float]]] = [
     ("$80k–$150k  (Middle)",       [87.5, 112.5, 137.5]),
     ("> $150k  (Higher Income)",   [175.0, 225.0]),
 ]
+
+_WIP_SINGLE_TRACT_MEAN_ACCEPTANCE_HELP = (
+    "Mean over Monte Carlo draws of the logit acceptance probability for this tract "
+    "(propensity exploration; not adoption uptake)."
+)
+
+# markdown for st.expander("Definition & formula") under KPIs and charts
+_FORMULA_MD_BUILDINGS_MODELLED = r"""
+### Buildings modelled
+
+Count of buildings in the policy impacts table for this run:
+
+$$
+N_{\mathrm{bldg}} = \#\{\text{buildings in policy impacts}\}
+$$
+"""
+
+_FORMULA_MD_MEAN_ACCEPTANCE_AGGREGATE = r"""
+### Mean acceptance (avg. over buildings)
+
+Let \(p_i\) be **acceptance probability** for row \(i\) (one row per building–retrofit, etc.).  
+\(p_i\) comes **only from the propensity model** (residential: mean of logit draws over propensity MC; commercial: NPV rule).  
+Adoption curves and uptake RNG **do not** change \(p_i\).
+
+$$
+\bar{p} = \frac{1}{N}\sum_{i=1}^{N} p_i
+$$
+
+where \(N\) is the number of propensity rows included in the mean (equal weight per row).
+"""
+
+_FORMULA_MD_SCENARIO_SUMMARY_TABLE = r"""
+### Scenario summary table
+
+**Final adoption (mean %)** — value of **cumulative adoption %** in the **last projection year**, from the **mean** trajectory of the uptake **MC ensemble** (many `dice_roll` runs).
+
+**Final adoption (P10–P90)** — same year, from the **10th and 90th percentiles** across those uptake runs.
+
+**Cumulative adoption %** at year \(t\):
+
+$$
+A(t) = \frac{n_{\mathrm{adopted}}(t)}{N_{\mathrm{bldg}}} \times 100\%
+$$
+
+**Emissions reduction vs baseline** (final year \(T\)):
+
+$$
+\frac{E_{\mathrm{baseline}}(T) - E_{\mathrm{scenario}}(T)}{E_{\mathrm{baseline}}(T)} \times 100\%
+$$
+"""
+
+_FORMULA_MD_ADOPTION_TRAJECTORY = r"""
+### Cumulative adoption (chart)
+
+The adoption **curve** in config is a **cumulative capacity** \(C(t) \in [0,1]\): target adopted count is \(\lfloor N \cdot C(t) \rfloor\) (see adoption JSON).
+
+Each **MC ensemble** run uses **dice roll** uptake.  If **dice re-entry** is off (``None``), each building draws \(u \sim \mathrm{Uniform}(0,1)\) **once** the first time there is positive adoption need; if \(p_i > u\) it stays in the *willing* pool, otherwise it is out; in later years only ranked allocation fills the curve (no re-roll).  If re-entry is on, each year each **eligible** building draws again, with cooldown **dice re-entry years** after a non-adoption.  Filling is always by highest \(p_i\) first up to the curve.  Optional attrition noise can reduce counts.
+
+The plotted **mean** line is the **mean** of \(A(t)\) across runs; the band is typically **P10–P90** across runs.
+
+The reserved **full adoption** scenario is different: it does **not** use propensity or the dice-roll MC. It assumes every building is on the retrofit from the first projection year (100% cumulative immediately), with no P10–P90 band — a theoretical ceiling for comparison.
+"""
+
+_FORMULA_MD_ENERGY_TRAJECTORY = r"""
+### Stock energy (GWh/yr)
+
+Total annual energy is a **mix** of baseline kWh for buildings not yet adopted and scenario (retrofit) kWh for adopted buildings, using the **mean** (and P10/P90) adoption fraction from uptake for each year.
+
+Conceptually:
+
+$$
+E_{\mathrm{stock}}(t) = \sum_{\text{buildings } i}
+\Bigl[ \alpha_i(t)\, E_{\mathrm{scenario},i}(t) + \bigl(1-\alpha_i(t)\bigr)\, E_{\mathrm{baseline},i}(t) \Bigr]
+$$
+
+with \(\alpha_i(t)\) the adopted fraction implied by cumulative adoption at \(t\) (from the ensemble mean path for the **mean** line).
+"""
+
+_FORMULA_MD_EMISSIONS_TRAJECTORY = r"""
+### Emissions (tCO₂/yr)
+
+For each year, building kWh by fuel is converted with **time-varying** emissions factors (kg CO₂/kWh), then summed. The same **adopted vs baseline** split as in the energy calculation applies:
+
+$$
+\mathrm{CO}_2(t) = \sum_i \sum_f kWh_{i,f}(t)\cdot \phi_f(t)
+$$
+
+where \(kWh_{i,f}\) follows baseline or retrofit depending on whether building \(i\) has adopted by \(t\), and \(\phi_f(t)\) is the factor for fuel \(f\). The chart shows **mean** and **P10–P90** when available.
+"""
+
+_FORMULA_MD_PROPENSITY_HISTOGRAM = r"""
+### Propensity distribution
+
+Histogram of **acceptance probability** \(p_i\) across buildings (same \(p_i\) as in the mean acceptance KPI). Residential values are **means over propensity MC draws** per building; commercial are **0 or 1** from NPV.
+"""
+
+_FORMULA_MD_ENERGY_SAVINGS_SCATTER = r"""
+### Energy savings vs propensity
+
+Each point is one building: **x** = annual energy cost savings (\$/yr), **y** = acceptance probability \(p_i\). Shows how financial savings relate to modelled willingness to accept.
+"""
+
+_FORMULA_MD_PORTFOLIO_RETROFIT_AND_INCENTIVE = r"""
+### Total gross retrofit cost (portfolio)
+
+Sum of **gross_upfront_usd** over all propensity rows in the with-incentive run. Each row is one building (or building–retrofit) using the same upfront cost field as the WTP model: \texttt{net\_cost.AllCustomers} or \texttt{cost.Total} (see propensity code). **Incentive pricing does not change** this — it is the gross **deal** cost before the income draw subtracts a subsidy in the logit.
+
+$$
+C_{\mathrm{gross}} = \sum_i \text{gross\_upfront\_usd}_i
+$$
+
+### Total expected incentives (portfolio)
+
+**Residential:** For each building, given census income draws, the incentive in USD in each draw is the tier’s configured flat amount. The column **expected_incentive_usd** is the mean of those draws. **Commercial** rows are 0.
+
+$$
+S_{\mathrm{exp}} = \sum_i \text{expected\_incentive\_usd}_i
+$$
+
+This is an **unweighted portfolio expectation** of subsidy outlay (not divided by adoption uptake; not conditional on a household accepting the deal). If every row in the table were a full retrofit at the assigned tier’s incentive, the implied average budget for incentives would scale with this sum. Optional attrition: compare to adoption-weighted outlay in downstream analysis if needed.
+"""
+
+_FORMULA_MD_ADOPTION_DEMO_BREAKDOWN = r"""
+### Adoption cohort by income / education (with incentive)
+
+**Who adopts?** The stock energy and emissions model ranks buildings by `acceptance_probability` and marks the first \(n\) rows as *adopted* for that year’s cumulative adoption %, where \(n = \mathrm{round}((A/100) \cdot N)\), \(A\) the mean cumulative % and \(N\) the number of policy rows.
+
+**Income and education bars:** Each building has **tract** multinomials (`income_probs`, `education_probs` from census). For a **stable, reproducible** label per building, we draw a single **deterministic** category index from that row’s using a fixed RNG seed derived from `building.id` (not the propensity MC). Counts in the bar chart are for the **with-incentive** final cohort of adopters (same \(n\) as above, ranked by with-incentive propensity). Commercial rows without tract lists may show **Unknown**.
+
+### Incentive / ranking comparison (same n)
+
+We compare the top \(n\) building ids by with-incentive propensity vs. the top \(n\) by no-incentive propensity for \(n = \min(n_{\text{no inc}}, n_{\text{inc}})\) from the two runs’ final cumulative %. **Replaced in rank** = \(|S_{\text{inc}} \setminus S_{\text{base}}|\) (same as \(|S_{\text{base}} \setminus S_{\text{inc}}|\) when \(|S|=n\) and ids are unique).
+
+**Expected incentives on the adopted cohort** = sum of `expected_incentive_usd` (mean draw per building from the with-incentive propensity run) over building ids in the with-incentive top-\(n_{\text{inc}}\) set.
+"""
+
+_FORMULA_MD_SAVED_SCENARIO_NAME = r"""
+### Scenario label
+
+The folder / display name chosen when saving this result bundle.
+"""
+
+_FORMULA_MD_SAVED_AT = r"""
+### Saved
+
+ISO timestamp written when **Save Results** ran (date shown is the calendar prefix).
+"""
+
+_FORMULA_MD_WIP_SINGLE_TRACT_ACCEPTANCE = r"""
+### Mean / median acceptance (tract, sim draws)
+
+For the selected tract, the model draws demographics \(S\) times (e.g. 10,000), evaluates the logit probability each draw, then reports the **mean** and **median** of those simulated probabilities. This is a **WTP explorer** shortcut; the main run uses the full propensity engine on your building table.
+"""
+
+_FORMULA_MD_WIP_TRACT_DRAWS_STD = r"""
+### Std deviation (sim draws)
+
+Sample standard deviation of the \(S\) simulated acceptance probabilities for this tract:
+
+$$
+s = \sqrt{\frac{1}{S-1}\sum_{k=1}^{S}(p_k - \bar{p})^2}
+$$
+"""
+
+_FORMULA_MD_WIP_STATEWIDE_MEAN = r"""
+### Mean (across tracts)
+
+Let \(\bar{p}_t\) be the tract-level mean of sim draws for tract \(t\). Displayed value:
+
+$$
+\frac{1}{T}\sum_{t=1}^{T} \bar{p}_t
+$$
+"""
+
+_FORMULA_MD_WIP_STATEWIDE_MEDIAN = r"""
+### Median (across tracts)
+
+Median of \(\{\bar{p}_1,\ldots,\bar{p}_T\}\).
+"""
+
+_FORMULA_MD_WIP_STATEWIDE_MIN = r"""
+### Min (across tracts)
+
+\(\displaystyle \min_t \bar{p}_t\).
+"""
+
+_FORMULA_MD_WIP_STATEWIDE_MAX = r"""
+### Max (across tracts)
+
+\(\displaystyle \max_t \bar{p}_t\).
+"""
+
+_FORMULA_MD_WIP_TRACT_ROW_COUNT = r"""
+### Census tracts
+
+Number of census tracts (rows) in the loaded demographic table for this state.
+"""
+
+_FORMULA_MD_WIP_COUNTY_COUNT = r"""
+### Counties
+
+Number of distinct county labels in that table.
+"""
 
 
 class IncentiveConfig(BaseModel):
@@ -115,6 +335,8 @@ st.set_page_config(
 _STATE_DEFAULTS: dict = {
     # {year: {"baseline": bytes, "scenario": bytes}} — one pair per simulated year
     "year_files": {},
+    # batch upload pool: filename -> bytes (used by "Upload many, pick per year")
+    "uploaded_pq_library": {},
     "selected_years": [2025],
     "n_years": 1,
     "scenario_name": "Retrofit",
@@ -123,6 +345,8 @@ _STATE_DEFAULTS: dict = {
     # {adoption_scenario_name: {"uptake": UptakeResult, "emissions": pd.DataFrame}}
     "scenario_results": {},
     "run_complete": False,
+    "dice_reentry_never": True,
+    "wip_dice_reentry_never": True,
 }
 for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
@@ -264,6 +488,7 @@ def _save_scenario_results(name: str) -> None:
             float(propensity_result.mean_acceptance_probability)
             if propensity_result is not None else None
         ),
+        "mean_acceptance_probability_definition": MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
         "n_adoption_scenarios": len(scenario_results),
         "adoption_scenario_names": list(scenario_results.keys()),
     }
@@ -378,6 +603,72 @@ def _render_config_manager() -> None:
         st.rerun()
 
 
+_YEAR_IN_NAME_RE = re.compile(r"\b(20[2-9]\d{2}|21\d{2})\b")
+
+
+def _energy_parquet_year_and_role(filename: str) -> tuple[int | None, str | None]:
+    """Infer simulated year and baseline vs scenario role from common naming patterns."""
+    m = _YEAR_IN_NAME_RE.search(filename)
+    yr = int(m.group(1)) if m else None
+    ln = filename.lower()
+    if "baseline" in ln:
+        return yr, "baseline"
+    if any(k in ln for k in ("retrofit", "deep", "scenario", "scen")):
+        return yr, "scenario"
+    return yr, None
+
+
+def _sync_uploaded_pq_library_from_files(uploaded_files) -> None:
+    """Merge multi-file uploader results into session uploaded_pq_library (read once per change)."""
+    if not uploaded_files:
+        return
+    sig = tuple((getattr(f, "name", ""), getattr(f, "size", None)) for f in uploaded_files)
+    if sig == st.session_state.get("_batch_upload_sig"):
+        return
+    st.session_state["_batch_upload_sig"] = sig
+    lib: dict[str, bytes] = st.session_state.setdefault("uploaded_pq_library", {})
+    names_seen: dict[str, int] = {}
+    for f in uploaded_files:
+        name = f.name or "unknown"
+        names_seen[name] = names_seen.get(name, 0) + 1
+        lib[name] = f.read()
+    dups = [n for n, c in names_seen.items() if c > 1]
+    if dups:
+        st.session_state["_batch_upload_duplicate_names"] = dups
+    else:
+        st.session_state.pop("_batch_upload_duplicate_names", None)
+
+
+def _auto_assign_library_to_years(
+    selected_years: list[int],
+    library: dict[str, bytes],
+    year_files: dict,
+) -> dict:
+    """Map library files to year_files using filename year + baseline/scenario hints."""
+    by_year: dict[int, dict[str, str]] = {}
+    for name in library:
+        yr, role = _energy_parquet_year_and_role(name)
+        if yr is None or role is None:
+            continue
+        by_year.setdefault(yr, {})[role] = name
+    out = {**year_files}
+    for yr in selected_years:
+        m = by_year.get(yr)
+        if not m:
+            continue
+        entry = dict(out.get(yr, {}))
+        if "baseline" in m:
+            bn = m["baseline"]
+            entry["baseline"] = library[bn]
+            entry["baseline_label"] = bn
+        if "scenario" in m:
+            sn = m["scenario"]
+            entry["scenario"] = library[sn]
+            entry["scenario_label"] = sn
+        out[yr] = entry
+    return out
+
+
 def _preview_parquet(file_bytes: bytes) -> dict:
     """Return quick stats from an uploaded EnergyAndPeak.pq."""
     try:
@@ -462,15 +753,23 @@ def _render_upload_tab() -> None:
     _um = st.session_state.get("upload_mode")
     if _um in ("Browse directory", "Browse outputs folder"):
         st.session_state["upload_mode"] = "Browse data inputs"
+    if _um == "Upload files":
+        st.session_state["upload_mode"] = "Upload files (per year)"
     upload_mode = st.radio(
         "File input method",
-        ["Upload files", "Browse data inputs"],
+        [
+            "Upload files (per year)",
+            "Upload many, pick per year",
+            "Browse data inputs",
+        ],
         horizontal=True,
         key="upload_mode",
         help=(
-            "**Upload files** — drag-and-drop or click to upload parquet files directly. "
-            "**Browse data inputs** — pick `.pq` / `.parquet` files under `data/inputs/` "
-            "(Docker mounts the host `./data` tree at `/code/data`)."
+            "**Per year** — one baseline + one scenario uploader per simulated year. "
+            "**Upload many** — add many `.pq` / `.parquet` files at once (select all in a folder "
+            "or drag multiple files; whole-folder drag depends on the browser), then choose each "
+            "file from a dropdown per year. **Browse data inputs** — files already under "
+            "`data/inputs/` (e.g. Docker mount of `./data`)."
         ),
     )
 
@@ -516,7 +815,7 @@ def _render_upload_tab() -> None:
                             if "error" in info:
                                 st.error(info["error"])
                             else:
-                                _show_file_kpis(info, "Baseline")
+                                _show_file_kpis(info)
                         elif entry.get("baseline") is not None:
                             st.caption("✓ Previously selected")
 
@@ -534,11 +833,121 @@ def _render_upload_tab() -> None:
                             if "error" in info:
                                 st.error(info["error"])
                             else:
-                                _show_file_kpis(info, st.session_state["scenario_name"])
+                                _show_file_kpis(info)
                         elif entry.get("scenario") is not None:
                             st.caption("✓ Previously selected")
 
                     year_files[yr] = entry
+
+    # ── batch upload: many files, assign baseline/scenario per year from pool ─
+    elif upload_mode == "Upload many, pick per year":
+        st.markdown(
+            "Drop **multiple** parquet files or use the file picker and choose **many** "
+            "(e.g. open your folder and select all). Each filename should be unique. "
+            "Then pick baseline and scenario files for each year below, or use **Auto-assign "
+            "from filenames** when names include the year and `baseline` / `retrofit` / `deep` / "
+            "`scenario`."
+        )
+        batch_files = st.file_uploader(
+            "Parquet files (multiple)",
+            type=["pq", "parquet"],
+            accept_multiple_files=True,
+            key="batch_pq_upload",
+            label_visibility="collapsed",
+        )
+        _sync_uploaded_pq_library_from_files(batch_files)
+        lib: dict[str, bytes] = st.session_state.get("uploaded_pq_library") or {}
+        if st.session_state.get("_batch_upload_duplicate_names"):
+            st.warning(
+                "Duplicate filenames in this batch — only the last of each name is kept. "
+                "Rename files so each is unique before uploading."
+            )
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Clear file pool", key="batch_clear_pool"):
+                st.session_state["uploaded_pq_library"] = {}
+                st.session_state.pop("_batch_upload_sig", None)
+                st.session_state.pop("_batch_upload_duplicate_names", None)
+                st.rerun()
+        with c2:
+            if st.button("Auto-assign from filenames", key="batch_auto_assign"):
+                merged = _auto_assign_library_to_years(
+                    selected_years, lib, st.session_state.get("year_files", {})
+                )
+                st.session_state["year_files"] = merged
+                st.session_state["_example_preloaded"] = False
+                for _yr in selected_years:
+                    ey = merged.get(_yr, {})
+                    st.session_state[f"batch_base_{_yr}"] = ey.get("baseline_label") or "— select —"
+                    st.session_state[f"batch_scen_{_yr}"] = ey.get("scenario_label") or "— select —"
+                st.rerun()
+        with c3:
+            st.caption(
+                f"**{len(lib)}** file(s) in pool — used for dropdowns below. "
+                "Clearing the uploader does not empty the pool; use **Clear file pool**."
+            )
+
+        file_options = ["— select —"] + sorted(lib.keys())
+        for _yr in selected_years:
+            _bk, _sk = f"batch_base_{_yr}", f"batch_scen_{_yr}"
+            if _bk in st.session_state and st.session_state[_bk] not in file_options:
+                st.session_state[_bk] = "— select —"
+            if _sk in st.session_state and st.session_state[_sk] not in file_options:
+                st.session_state[_sk] = "— select —"
+        if not lib:
+            st.info("Upload at least one `.pq` or `.parquet` file to populate the pool.")
+        for yr in selected_years:
+            with st.expander(f"Year {yr}", expanded=True):
+                col_b, col_s = st.columns(2)
+                entry = dict(year_files.get(yr, {}))
+                if (obl := entry.get("baseline_label")) and obl not in lib:
+                    entry.pop("baseline", None)
+                    entry.pop("baseline_label", None)
+                if (osl := entry.get("scenario_label")) and osl not in lib:
+                    entry.pop("scenario", None)
+                    entry.pop("scenario_label", None)
+
+                with col_b:
+                    st.markdown("**Baseline**")
+                    base_sel = st.selectbox(
+                        f"Baseline {yr}", options=file_options,
+                        key=f"batch_base_{yr}", label_visibility="collapsed",
+                    )
+                    if base_sel == "— select —":
+                        entry.pop("baseline", None)
+                        entry.pop("baseline_label", None)
+                    elif base_sel in lib:
+                        data = lib[base_sel]
+                        entry["baseline"] = data
+                        entry["baseline_label"] = base_sel
+                        st.session_state["_example_preloaded"] = False
+                        info = _preview_parquet(data)
+                        if "error" in info:
+                            st.error(info["error"])
+                        else:
+                            _show_file_kpis(info)
+
+                with col_s:
+                    st.markdown(f"**{st.session_state['scenario_name']}**")
+                    scen_sel = st.selectbox(
+                        f"Scenario {yr}", options=file_options,
+                        key=f"batch_scen_{yr}", label_visibility="collapsed",
+                    )
+                    if scen_sel == "— select —":
+                        entry.pop("scenario", None)
+                        entry.pop("scenario_label", None)
+                    elif scen_sel in lib:
+                        data = lib[scen_sel]
+                        entry["scenario"] = data
+                        entry["scenario_label"] = scen_sel
+                        st.session_state["_example_preloaded"] = False
+                        info = _preview_parquet(data)
+                        if "error" in info:
+                            st.error(info["error"])
+                        else:
+                            _show_file_kpis(info)
+
+                year_files[yr] = entry
 
     # ── Upload files mode (original) ──────────────────────────────────────────
     else:
@@ -561,7 +970,7 @@ def _render_upload_tab() -> None:
                         if "error" in info:
                             st.error(info["error"])
                         else:
-                            _show_file_kpis(info, "Baseline")
+                            _show_file_kpis(info)
                     elif entry.get("baseline") is not None:
                         st.caption("✓ Previously uploaded")
 
@@ -579,7 +988,7 @@ def _render_upload_tab() -> None:
                         if "error" in info:
                             st.error(info["error"])
                         else:
-                            _show_file_kpis(info, st.session_state["scenario_name"])
+                            _show_file_kpis(info)
                     elif entry.get("scenario") is not None:
                         st.caption("✓ Previously uploaded")
 
@@ -600,13 +1009,16 @@ def _render_upload_tab() -> None:
         st.info("Upload Baseline and Scenario files for at least one year to continue.")
 
 
-def _show_file_kpis(info: dict, label: str) -> None:
+def _show_file_kpis(info: dict) -> None:
     k1, k2, k3 = st.columns(3)
-    k1.metric("Buildings", info.get("n_buildings", "—"))
     area = info.get("total_area_m2")
-    k2.metric("Total area", f"{area:,.0f} m²" if area else "—")
     scens = info.get("scenarios", [])
-    k3.metric("Scenario(s) in file", ", ".join(scens) if scens else "—")
+    with k1:
+        st.metric("Buildings", info.get("n_buildings", "—"))
+    with k2:
+        st.metric("Total area", f"{area:,.0f} m²" if area else "—")
+    with k3:
+        st.metric("Scenario(s) in file", ", ".join(scens) if scens else "—")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -806,8 +1218,30 @@ def _render_config_tab() -> None:
             value=int(st.session_state.get("random_seed", 42)),
             step=1, key="cfg_seed",
         )
+    st.caption("Dice roll re-entry (after a year with no adoption for a building):")
+    dr_col1, dr_col2 = st.columns(2)
+    with dr_col1:
+        dice_no_reentry = st.checkbox(
+            "No re-entry (without replacement on failure)",
+            value=bool(st.session_state.get("dice_reentry_never", True)),
+            key="cfg_dice_reentry_never",
+            help="If a building could adopt but does not, it never enters the draw again.",
+        )
+    with dr_col2:
+        dice_reentry_n = st.number_input(
+            "Years until re-eligible",
+            min_value=1,
+            max_value=30,
+            value=int(st.session_state.get("dice_reentry_years", 1)),
+            step=1,
+            key="cfg_dice_reentry_years",
+            disabled=dice_no_reentry,
+            help="Default 1 = same as legacy (can try again next year).",
+        )
     for k, v in [("n_mc_samples", n_mc), ("n_ensemble_runs", n_ensemble), ("random_seed", seed)]:
         st.session_state[k] = int(v)
+    st.session_state["dice_reentry_never"] = dice_no_reentry
+    st.session_state["dice_reentry_years"] = int(dice_reentry_n)
 
     st.divider()
 
@@ -958,7 +1392,10 @@ _RESERVED_SCENARIOS: dict[str, dict] = {
         "values": {str(y): 0.0 for y in range(2024, 2101)},
     },
     "full_adoption": {
-        "description": "Full adoption — 100% throughout (theoretical maximum)",
+        "description": (
+            "Theoretical max — 100% of buildings retrofitted in the first projection year; "
+            "no propensity / uptake MC (ceiling for comparison only)"
+        ),
         "curve_type": "flat",
         "max_adoption": 1.0,
         "annual_attrition": 0.0,
@@ -1570,6 +2007,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 propensity_result_inc,
             )
             st.session_state["propensity_result_incentive"] = propensity_result_inc
+            st.session_state["policy_impacts_incentive"] = policy_impacts_inc
         except Exception as exc:
             st.warning(f"Incentive propensity model failed: {exc}")
             incentives_enabled = False
@@ -1635,6 +2073,88 @@ def _join_propensity_scores(policy_impacts: pd.DataFrame, propensity_result) -> 
     return policy_impacts
 
 
+def _theoretical_full_uptake_result(
+    propensity_df: pd.DataFrame,
+    start_yr: int,
+    end_yr: int,
+) -> UptakeResult:
+    """100% of buildings adopted from the first projection year — no propensity-weighted uptake.
+
+    used only for the reserved scenario name full_adoption, not for user curves that hit 100%.
+    """
+    years = list(range(start_yr, end_yr + 1))
+    rfs = (
+        propensity_df["retrofit.scenario"].unique().tolist()
+        if "retrofit.scenario" in propensity_df.columns
+        else ["default"]
+    )
+    out_df = propensity_df.copy()
+    out_df["passes_threshold"] = True
+
+    yearly_rows: list[dict] = []
+    for rf in rfs:
+        sub = (
+            out_df[out_df["retrofit.scenario"] == rf]
+            if "retrofit.scenario" in out_df.columns
+            else out_df
+        )
+        n_b = len(sub)
+        prev = 0.0
+        for y in years:
+            cum = 100.0
+            yearly_pct = max(0.0, cum - prev)
+            yearly_rows.append({
+                "year": y,
+                "retrofit.scenario": rf,
+                "method": "theoretical_full",
+                "adoption_scenario": "full_adoption",
+                "n_buildings": n_b,
+                "cumulative_adoption_pct": cum,
+                "yearly_adoption_pct": yearly_pct,
+                "n_adopting": int(round(yearly_pct / 100.0 * n_b)) if n_b else 0,
+                "curve_target_pct": 100.0,
+                "cumulative_adoption_pct_p10": 100.0,
+                "cumulative_adoption_pct_p90": 100.0,
+            })
+            prev = cum
+
+    by_scen: dict[str, dict] = {}
+    for rf in rfs:
+        sub = (
+            out_df[out_df["retrofit.scenario"] == rf]
+            if "retrofit.scenario" in out_df.columns
+            else out_df
+        )
+        mean_p = (
+            float(sub["acceptance_probability"].mean())
+            if "acceptance_probability" in sub.columns and len(sub) else 0.0
+        )
+        by_scen[rf] = {
+            "n_total": len(sub),
+            "n_passing_threshold": len(sub),
+            "pass_rate": 1.0 if len(sub) else 0.0,
+            "mean_acceptance_probability": mean_p,
+        }
+    scenario_summary: dict = {
+        "method": "theoretical_full",
+        "adoption_scenario": "full_adoption",
+        "theoretical_maximum_no_propensity": True,
+        "acceptance_threshold": 0.0,
+        "floor_threshold": 0.0,
+        "dice_reentry_years": None,
+        "time_horizon": {"start_year": start_yr, "end_year": end_yr},
+        "mean_acceptance_probability_definition": MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION,
+        "by_scenario": by_scen,
+    }
+    return UptakeResult(
+        data=out_df,
+        yearly_summary=pd.DataFrame(yearly_rows),
+        scenario_summary=scenario_summary,
+        method="theoretical_full",
+        adoption_scenario_name="full_adoption",
+    )
+
+
 def _run_adoption_emissions_loop(
     propensity_result,
     policy_impacts: pd.DataFrame,
@@ -1655,17 +2175,31 @@ def _run_adoption_emissions_loop(
         pct = p_lo + int((p_hi - p_lo) * i / n_scen)
         progress_bar.progress(pct, text=f"Projecting '{adoption_scenario_name}' ({i + 1}/{n_scen})…")
         try:
-            uptake_engine = AdoptionEngine(
-                propensity_df=propensity_result.data,
-                adoption_rates_path=_ADOPTION_CURVES_PATH,
-                adoption_scenario=adoption_scenario_name,
-                method="mc_ensemble",
-                start_year=start_yr,
-                end_year=end_yr,
-                n_ensemble_runs=int(st.session_state.get("n_ensemble_runs", 100)),
-                random_seed=int(st.session_state.get("random_seed", 42)),
-            )
-            uptake_result = uptake_engine.calculate_uptake()
+            # only the locked reserved id "full_adoption" bypasses the engine.
+            # user-defined curves that reach 100% still use AdoptionEngine + propensity.
+            if adoption_scenario_name == "full_adoption":
+                uptake_result = _theoretical_full_uptake_result(
+                    propensity_result.data, start_yr, end_yr
+                )
+            else:
+                dr_years = st.session_state.get("dice_reentry_years", 1)
+                dice_reentry: int | None
+                if st.session_state.get("dice_reentry_never", True):
+                    dice_reentry = None
+                else:
+                    dice_reentry = int(dr_years)
+                uptake_engine = AdoptionEngine(
+                    propensity_df=propensity_result.data,
+                    adoption_rates_path=_ADOPTION_CURVES_PATH,
+                    adoption_scenario=adoption_scenario_name,
+                    method="mc_ensemble",
+                    start_year=start_yr,
+                    end_year=end_yr,
+                    n_ensemble_runs=int(st.session_state.get("n_ensemble_runs", 100)),
+                    random_seed=int(st.session_state.get("random_seed", 42)),
+                    dice_reentry_years=dice_reentry,
+                )
+                uptake_result = uptake_engine.calculate_uptake()
         except Exception as exc:
             st.warning(f"Adoption scenario '{adoption_scenario_name}' failed: {exc}")
             continue
@@ -1841,11 +2375,209 @@ def _build_emissions_fig(scenario_results: dict, first_em: pd.DataFrame, simulat
     return fig
 
 
+def _build_energy_usage_fig(
+    scenario_results: dict, first_em: pd.DataFrame, simulated_years: list[int],
+) -> go.Figure:
+    fig = go.Figure()
+    if not first_em.empty and "baseline_kwh_GWh" in first_em.columns:
+        fig.add_trace(go.Scatter(
+            x=first_em["year"].tolist(), y=first_em["baseline_kwh_GWh"].tolist(),
+            mode="lines", name="Baseline (0% adoption)",
+            line=dict(color="#dc2626", width=2.5, dash="dot"),
+        ))
+    for i, (name, res) in enumerate(scenario_results.items()):
+        em = res["emissions"]
+        if em.empty or "scenario_kwh_mean_GWh" not in em.columns:
+            continue
+        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
+        mean_kwh = em["scenario_kwh_mean_GWh"]
+        p10_kwh = em["scenario_kwh_p10_GWh"] if "scenario_kwh_p10_GWh" in em.columns else None
+        p90_kwh = em["scenario_kwh_p90_GWh"] if "scenario_kwh_p90_GWh" in em.columns else None
+        _add_scenario_traces(
+            fig, em["year"].tolist(), mean_kwh,
+            pd.Series(p10_kwh.values, index=mean_kwh.index) if p10_kwh is not None else None,
+            pd.Series(p90_kwh.values, index=mean_kwh.index) if p90_kwh is not None else None,
+            name, line_color, band_rgba,
+        )
+    for yr in simulated_years:
+        fig.add_vline(x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
+                      annotation_text=str(yr), annotation_position="top",
+                      annotation_font_size=11, annotation_font_color="#64748b")
+    fig.update_layout(yaxis_title="GWh/yr", xaxis_title="Year",
+                      height=400, margin=dict(t=20, b=20),
+                      legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
 def _first_em(scenario_results: dict) -> pd.DataFrame:
     return next(
         (v["emissions"] for v in scenario_results.values() if not v["emissions"].empty),
         pd.DataFrame(),
     )
+
+
+def _sum_portfolio_retrofit_and_incentive(inc_data: pd.DataFrame) -> tuple[float | None, float | None]:
+    """(total_gross_upfront_usd, total_expected_incentive_usd) or (None, None) if not available."""
+    if inc_data.empty or "gross_upfront_usd" not in inc_data.columns:
+        return None, None
+    g = float(inc_data["gross_upfront_usd"].fillna(0.0).sum())
+    ecol = inc_data.get("expected_incentive_usd")
+    s = float(ecol.fillna(0.0).sum()) if ecol is not None else 0.0
+    return g, s
+
+
+def _render_adoption_incentive_breakdown(
+    policy_base: pd.DataFrame,
+    policy_inc: pd.DataFrame,
+    prop_base,
+    prop_inc,
+    scenario_results: dict,
+    scenario_results_inc: dict,
+    retrofit_name: str,
+) -> None:
+    """Cohort by income/education; ranking displacement and incentive on adopted."""
+    if (
+        "acceptance_probability" not in policy_base.columns
+        or "acceptance_probability" not in policy_inc.columns
+    ):
+        st.info("Adoption breakdown needs **acceptance_probability** on policy impacts (re-run analysis).")
+        return
+    keys_i = [k for k in scenario_results_inc if scenario_results.get(k)]
+    if not keys_i:
+        return
+    ad_name = keys_i[0]
+    yb = scenario_results[ad_name]["uptake"].yearly_summary
+    yi = scenario_results_inc[ad_name]["uptake"].yearly_summary
+    # session scenario_name can differ from what was written to policy/ propensity
+    r_label = resolve_retrofit_scenario_name(policy_inc, retrofit_name)
+    row_b = last_year_uptake_row(yb, ad_name, r_label)
+    row_i = last_year_uptake_row(yi, ad_name, r_label)
+    n_b = n_adopters_from_yearly_row(row_b) if row_b is not None else 0
+    n_i = n_adopters_from_yearly_row(row_i) if row_i is not None else 0
+    cum_b = float(row_b.get("cumulative_adoption_pct", 0.0) or 0.0) if row_b is not None else 0.0
+    cum_i = float(row_i.get("cumulative_adoption_pct", 0.0) or 0.0) if row_i is not None else 0.0
+    n_w_incentive = count_adopters_with_positive_incentive(
+        policy_inc, "acceptance_probability", n_i, prop_inc.data, min_usd=0.0
+    )
+    n_eq = min(n_b, n_i)
+
+    st.markdown("### Adoption cohort & incentive lift")
+    st.caption(
+        f"**Retrofit label used:** “{r_label}”  |  **Adoption curve:** `{ad_name}`. "
+        "If you renamed the retrofit after the run, we match from policy data. "
+        "Counts = mean uptake path ×**n_buildings** in that run (same as emissions). "
+        "“Use incentives” = adopters in the retrofit cohort with **expected_incentive_usd** > 0 "
+        "(residential only get non-zero in the model; commercial counts as 0 here)."
+    )
+    with st.expander("Definition & formula — adoption cohort & incentive lift", expanded=False):
+        st.markdown(_FORMULA_MD_ADOPTION_DEMO_BREAKDOWN)
+
+    mcols = st.columns(2)
+    if row_b is None and row_i is None:
+        st.warning(
+            f"No **yearly_summary** row matched (adoption `{ad_name}`, retrofit `{r_label}`). "
+            "If you renamed the retrofit scenario in the app, re-run the analysis. "
+        )
+    mcols[0].metric(
+        "Buildings that retrofit (with incentive run, final year, mean path)",
+        f"{n_i:,}" if row_i is not None else "—",
+        help=(
+            f"round(cumulative % × n_buildings) in uptake; here ≈{cum_i:.1f}% and "
+            f"n_bld={int(row_i.get('n_buildings', 0) or 0)}"
+        )
+        if row_i is not None
+        else "no matching row",
+    )
+    mcols[1].metric(
+        "Of those, with a positive program incentive (expected, mean draw)",
+        f"{n_w_incentive:,}" if row_i is not None else "—",
+        help="Among top n_i by with-incentive propensity; count expected_incentive_usd > 0 on propensity data",
+    )
+    mcols2 = st.columns(3)
+    mcols2[0].metric(
+        "Buildings that retrofit (no incentive run)",
+        f"{n_b:,}" if row_b is not None else "—",
+        help=f"≈{cum_b:.1f}% cumulative" if row_b is not None else "no matching row",
+    )
+    mcols2[1].metric("Extra adopters (with − without)", f"{n_i - n_b:+,}", help="same adoption curve, different propensity")
+    if n_eq > 0 and n_b and n_i:
+        only_i, _only_b, _ovl = ranking_displacement_at_equal_n(
+            policy_inc["building.id"],
+            policy_base["acceptance_probability"],
+            policy_inc["acceptance_probability"],
+            n_eq,
+        )
+        mcols2[2].metric(
+            f"Re-ranked in top {n_eq} (same n, both runs)",
+            f"{only_i}",
+            help="How many of the n slots go to different buildings when ranking by with- vs no-incentive propensity",
+        )
+    else:
+        mcols2[2].metric("Re-ranked in top n", "—")
+
+    cohort = build_adoption_cohort_by_demographics(
+        policy_inc, "acceptance_probability", n_i
+    )
+    inc_cohort_usd = expected_incentive_sum_on_adopted_cohort(
+        policy_inc, "acceptance_probability", n_i, prop_inc.data
+    )
+    tot_s = _sum_portfolio_retrofit_and_incentive(prop_inc.data)[1]
+    if inc_cohort_usd is not None and tot_s is not None and tot_s > 0:
+        st.caption(
+            f"**Expected incentives on the adopted cohort (with incentive):** ${inc_cohort_usd:,.0f} "
+            f"({100.0 * inc_cohort_usd / tot_s:.1f}% of the portfolio-expected total incentive pool)."
+        )
+    elif inc_cohort_usd is not None:
+        st.caption(
+            f"**Expected incentives on the adopted cohort (with incentive):** ${inc_cohort_usd:,.0f}."
+        )
+
+    in_counts = cohort["income_counts"]
+    ed_counts = cohort["education_counts"]
+    c1, c2 = st.columns(2)
+    with c1:
+        if in_counts:
+            s_inc = pd.Series(in_counts).sort_index()
+            fig = go.Figure(
+                go.Bar(
+                    x=s_inc.index,
+                    y=s_inc.values,
+                    marker_color="#16a34a",
+                    name="Buildings",
+                )
+            )
+            fig.update_layout(
+                title="Adopted cohort by income (tract-based, n=%d)" % n_i,
+                xaxis_title="",
+                yaxis_title="Buildings",
+                height=400,
+                margin=dict(t=40, b=80),
+            )
+            fig.update_xaxis(tickangle=45)
+            st.plotly_chart(fig, use_container_width=True, key="adopt_demo_income")
+        else:
+            st.caption("No income breakdown (missing tract `income_probs` on policy impacts).")
+    with c2:
+        if ed_counts:
+            s_ed = pd.Series(ed_counts).sort_index()
+            fig2 = go.Figure(
+                go.Bar(
+                    x=s_ed.index,
+                    y=s_ed.values,
+                    marker_color="#2563eb",
+                )
+            )
+            fig2.update_layout(
+                title="Adopted cohort by education (tract-based, n=%d)" % n_i,
+                xaxis_title="",
+                yaxis_title="Buildings",
+                height=400,
+                margin=dict(t=40, b=80),
+            )
+            fig2.update_xaxis(tickangle=35)
+            st.plotly_chart(fig2, use_container_width=True, key="adopt_demo_edu")
+        else:
+            st.caption("No education breakdown (missing `education_probs`).")
 
 
 # ── Results charts ─────────────────────────────────────────────────────────────
@@ -1869,12 +2601,46 @@ def _render_result_charts() -> None:
     n_buildings = len(policy_impacts)
     mean_prop = float(propensity_result.mean_acceptance_probability)
     kpi_cols = st.columns(3 if incentives_enabled else 2)
-    kpi_cols[0].metric("Buildings modelled", f"{n_buildings:,}")
-    kpi_cols[1].metric("Mean acceptance prob. (no incentive)", f"{mean_prop:.1%}")
+    with kpi_cols[0]:
+        st.metric("Buildings modelled", f"{n_buildings:,}")
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_BUILDINGS_MODELLED)
+    with kpi_cols[1]:
+        st.metric(
+            f"{MEAN_ACCEPTANCE_AGGREGATE_LABEL} (no incentive)",
+            f"{mean_prop:.1%}",
+            help=MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+        )
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_MEAN_ACCEPTANCE_AGGREGATE)
     if incentives_enabled and propensity_result_inc:
         mean_prop_inc = float(propensity_result_inc.mean_acceptance_probability)
-        kpi_cols[2].metric("Mean acceptance prob. (with incentive)", f"{mean_prop_inc:.1%}",
-                           delta=f"{mean_prop_inc - mean_prop:+.1%}")
+        with kpi_cols[2]:
+            st.metric(
+                f"{MEAN_ACCEPTANCE_AGGREGATE_LABEL} (with incentive)",
+                f"{mean_prop_inc:.1%}",
+                delta=f"{mean_prop_inc - mean_prop:+.1%}",
+                help=MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+            )
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_MEAN_ACCEPTANCE_AGGREGATE)
+        tot_g, tot_s = _sum_portfolio_retrofit_and_incentive(propensity_result_inc.data)
+        if tot_g is not None:
+            kpi_cost = st.columns(2)
+            with kpi_cost[0]:
+                st.metric(
+                    "Total gross retrofit cost (portfolio)",
+                    f"${tot_g:,.0f}",
+                    help="sum of per-row upfront deal cost (USD); not net of incentives. see expander for formula.",
+                )
+            with kpi_cost[1]:
+                st.metric(
+                    "Total expected incentives (portfolio)",
+                    f"${tot_s:,.0f}",
+                    help="sum of mean draw incentive per building (USD); not adoption-weighted. see expander.",
+                )
+            with st.expander("Definition & formula — portfolio cost & incentives", expanded=False):
+                st.markdown(_FORMULA_MD_PORTFOLIO_RETROFIT_AND_INCENTIVE)
 
     # ── Summary table (base only) ──────────────────────────────────────────────
     summary_rows = []
@@ -1901,13 +2667,34 @@ def _render_result_charts() -> None:
             "Emissions reduction vs baseline": f"{savings:.1f}%" if not pd.isna(savings) else "—",
         })
     if summary_rows:
+        with st.expander("Definition & formula — scenario summary columns", expanded=False):
+            st.markdown(_FORMULA_MD_SCENARIO_SUMMARY_TABLE)
         st.dataframe(pd.DataFrame(summary_rows).set_index("Adoption scenario"),
                      use_container_width=True)
+
+    if (
+        incentives_enabled
+        and st.session_state.get("policy_impacts_incentive") is not None
+        and propensity_result_inc
+        and scenario_results_inc
+    ):
+        st.divider()
+        _render_adoption_incentive_breakdown(
+            policy_base=policy_impacts,
+            policy_inc=st.session_state["policy_impacts_incentive"],
+            prop_base=propensity_result,
+            prop_inc=propensity_result_inc,
+            scenario_results=scenario_results,
+            scenario_results_inc=scenario_results_inc,
+            retrofit_name=retrofit_name,
+        )
 
     st.divider()
 
     # ── Adoption trajectories ─────────────────────────────────────────────────
     st.markdown(f"### Adoption Trajectories — {retrofit_name}")
+    with st.expander("Definition & formula — cumulative adoption", expanded=False):
+        st.markdown(_FORMULA_MD_ADOPTION_TRAJECTORY)
     if incentives_enabled and scenario_results_inc:
         col_l, col_r = st.columns(2)
         with col_l:
@@ -1929,35 +2716,27 @@ def _render_result_charts() -> None:
         "Total building-stock energy each year: adopted buildings contribute retrofit-scenario kWh, "
         "all others contribute baseline kWh. As adoption grows the total decreases toward the full-retrofit level."
     )
-    fig_energy = go.Figure()
-    if not em_base.empty and "baseline_kwh_GWh" in em_base.columns:
-        fig_energy.add_trace(go.Scatter(
-            x=em_base["year"].tolist(), y=em_base["baseline_kwh_GWh"].tolist(),
-            mode="lines", name="Baseline (0% adoption)",
-            line=dict(color="#dc2626", width=2.5, dash="dot"),
-        ))
-    for i, (name, res) in enumerate(scenario_results.items()):
-        em = res["emissions"]
-        if em.empty or "scenario_kwh_mean_GWh" not in em.columns:
-            continue
-        line_color, band_rgba = _SCENARIO_PALETTE[i % len(_SCENARIO_PALETTE)]
-        mean_kwh = em["scenario_kwh_mean_GWh"]
-        p10_kwh = em["scenario_kwh_p10_GWh"] if "scenario_kwh_p10_GWh" in em.columns else None
-        p90_kwh = em["scenario_kwh_p90_GWh"] if "scenario_kwh_p90_GWh" in em.columns else None
-        _add_scenario_traces(
-            fig_energy, em["year"].tolist(), mean_kwh,
-            pd.Series(p10_kwh.values, index=mean_kwh.index) if p10_kwh is not None else None,
-            pd.Series(p90_kwh.values, index=mean_kwh.index) if p90_kwh is not None else None,
-            name, line_color, band_rgba,
+    with st.expander("Definition & formula — stock energy", expanded=False):
+        st.markdown(_FORMULA_MD_ENERGY_TRAJECTORY)
+    if incentives_enabled and scenario_results_inc:
+        col_el, col_er = st.columns(2)
+        with col_el:
+            st.caption("No incentive")
+            st.plotly_chart(
+                _build_energy_usage_fig(scenario_results, em_base, simulated_years),
+                use_container_width=True, key="energy_usage_base",
+            )
+        with col_er:
+            st.caption("With incentive")
+            st.plotly_chart(
+                _build_energy_usage_fig(scenario_results_inc, em_inc, simulated_years),
+                use_container_width=True, key="energy_usage_inc",
+            )
+    else:
+        st.plotly_chart(
+            _build_energy_usage_fig(scenario_results, em_base, simulated_years),
+            use_container_width=True, key="energy_usage",
         )
-    for yr in simulated_years:
-        fig_energy.add_vline(x=yr, line_dash="dot", line_color="#94a3b8", line_width=1,
-                             annotation_text=str(yr), annotation_position="top",
-                             annotation_font_size=11, annotation_font_color="#64748b")
-    fig_energy.update_layout(yaxis_title="GWh/yr", xaxis_title="Year",
-                              height=400, margin=dict(t=20, b=20),
-                              legend=dict(orientation="h", y=-0.2))
-    st.plotly_chart(fig_energy, use_container_width=True, key="energy_usage")
 
     # ── Emissions trajectories ─────────────────────────────────────────────────
     st.divider()
@@ -1966,6 +2745,8 @@ def _render_result_charts() -> None:
         "kWh from the energy chart × per-fuel emissions factors (which decline with grid decarbonisation). "
         "Shaded band = MC P10–P90."
     )
+    with st.expander("Definition & formula — emissions", expanded=False):
+        st.markdown(_FORMULA_MD_EMISSIONS_TRAJECTORY)
     if incentives_enabled and scenario_results_inc:
         col_l, col_r = st.columns(2)
         with col_l:
@@ -1983,6 +2764,8 @@ def _render_result_charts() -> None:
     # ── Propensity distribution ───────────────────────────────────────────────
     st.divider()
     st.markdown("### Propensity Distribution")
+    with st.expander("Definition & formula — propensity histogram", expanded=False):
+        st.markdown(_FORMULA_MD_PROPENSITY_HISTOGRAM)
 
     def _propensity_hist(result, color: str, label: str) -> go.Figure:
         probs = result.data["acceptance_probability"].dropna()
@@ -2008,6 +2791,8 @@ def _render_result_charts() -> None:
                             use_container_width=True, key="propensity_base")
         with col_e:
             st.markdown("### Energy Savings vs. Propensity")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_ENERGY_SAVINGS_SCATTER)
             plot_df = policy_impacts if "acceptance_probability" in policy_impacts.columns else (
                 policy_impacts.join(
                     propensity_result.data.set_index("building.id")[["acceptance_probability"]],
@@ -2102,7 +2887,7 @@ def _render_result_charts() -> None:
 # TAB 6 — WIP EXPLORER  (National Retrofit Deal Acceptance Simulator)
 # ══════════════════════════════════════════════════════════════════════════════
 
-_CENSUS_API_KEY = "e865d3af152108cb504df27535d196f586c21729"
+_CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "e865d3af152108cb504df27535d196f586c21729")
 
 _WIP_COEFFICIENTS = {
     "intercept": 0.0,
@@ -2242,6 +3027,26 @@ _ACS_VARIABLE_CHUNKS = {
 }
 
 
+def _wip_census_get(url: str, params: dict, *, read_timeout: int = 300) -> requests.Response:
+    # large tract:* state pulls often exceed 60s; retry on timeouts and brief upstream errors
+    last_exc: BaseException | None = None
+    for attempt in range(4):
+        try:
+            resp = requests.get(url, params=params, timeout=(30, read_timeout))
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(min(2.0 * (2**attempt), 30.0))
+            continue
+        if resp.status_code in (502, 503, 504) and attempt < 3:
+            time.sleep(min(2.0 * (2**attempt), 30.0))
+            continue
+        return resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("census request failed with no response")
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def _wip_load_ma_census(file_path: str) -> pd.DataFrame | None:
     import os
@@ -2273,7 +3078,13 @@ def _wip_fetch_census(state_fips: str) -> pd.DataFrame | None:
             "key": _CENSUS_API_KEY,
         }
         try:
-            resp = requests.get(base_url, params=params, timeout=60)
+            resp = _wip_census_get(base_url, params)
+        except requests.RequestException as exc:
+            st.error(
+                f"Census API request failed after retries: {exc}. "
+                "Try again in a moment, pick a smaller state, or set CENSUS_API_KEY for higher rate limits."
+            )
+            return None
         except Exception as exc:
             st.error(f"Census API request failed: {exc}")
             return None
@@ -2296,10 +3107,10 @@ def _wip_fetch_census(state_fips: str) -> pd.DataFrame | None:
 @st.cache_data(show_spinner=False, ttl=86400)
 def _wip_fetch_county_names(state_fips: str) -> dict[str, str]:
     try:
-        resp = requests.get(
+        resp = _wip_census_get(
             "https://api.census.gov/data/2020/dec/pl",
-            params={"get": "NAME", "for": "county:*", "in": f"state:{state_fips}", "key": _CENSUS_API_KEY},
-            timeout=30,
+            {"get": "NAME", "for": "county:*", "in": f"state:{state_fips}", "key": _CENSUS_API_KEY},
+            read_timeout=120,
         )
         if resp.status_code != 200:
             return {}
@@ -2460,35 +3271,80 @@ def _wip_integrate_ranked(prop, curve, years, floor):
     return r
 
 
-def _wip_integrate_dice(prop, curve, years, rng, floor=0.0):
+def _wip_integrate_dice(
+    prop,
+    curve,
+    years,
+    rng,
+    floor=0.0,
+    dice_reentry_years: int | None = 1,
+):
     n = len(prop)
     if n == 0:
         return {}
     candidates = {k: float(v) for k, v in prop.items() if v >= floor}
     all_bids = list(candidates.keys())
     adopted_set, adoption_by_year, adopted_so_far = set(), {}, 0
+    excluded = set()
+    next_eligible = {}
+    reentry = None if dice_reentry_years is None else max(1, int(dice_reentry_years))
     for year in years:
         need = max(0, int(n * curve.get(year, 0.0)) - adopted_so_far)
         if need == 0:
             continue
-        eligible = [b for b in all_bids if b not in adopted_set]
+        eligible = [
+            b
+            for b in all_bids
+            if b not in adopted_set
+            and b not in excluded
+            and year >= next_eligible.get(b, 0)
+        ]
         if not eligible:
             break
         draws = rng.uniform(0, 1, len(eligible))
-        hits = sorted([b for b, u in zip(eligible, draws) if candidates[b] > u], key=lambda b: candidates[b], reverse=True)
+        hits = sorted(
+            [b for b, u in zip(eligible, draws) if candidates[b] > u],
+            key=lambda b: candidates[b],
+            reverse=True,
+        )
+        chosen = set(hits[:need])
         for bid in hits[:need]:
             adoption_by_year[bid] = year
             adopted_set.add(bid)
             adopted_so_far += 1
+        for bid in eligible:
+            if bid in chosen:
+                continue
+            if reentry is None:
+                excluded.add(bid)
+            else:
+                next_eligible[bid] = year + reentry
     return adoption_by_year
 
 
-def _wip_integrate_ensemble(prop, curve, years, n_runs, floor, seed, ci_low=10.0, ci_high=90.0):
+def _wip_integrate_ensemble(
+    prop,
+    curve,
+    years,
+    n_runs,
+    floor,
+    seed,
+    ci_low=10.0,
+    ci_high=90.0,
+    dice_reentry_years: int | None = 1,
+):
     rng0 = np.random.default_rng(seed)
     seeds = rng0.integers(0, 2**32, size=n_runs)
     assignments, rows = [], []
     for s in seeds:
-        a = _wip_integrate_dice(prop, curve, years, np.random.default_rng(int(s)), floor=floor)
+        a = _wip_integrate_dice(
+            prop,
+            curve,
+            years,
+            np.random.default_rng(int(s)),
+            floor=floor,
+            dice_reentry_years=dice_reentry_years,
+        )
         assignments.append(a)
         rows.append(_wip_cumulative_pct(a, years, len(prop)).values)
     arr = np.stack(rows)
@@ -2620,8 +3476,14 @@ def _render_wip_explorer_tab() -> None:
     n_tracts = len(df)
     n_counties = df["county_name"].nunique() if "county_name" in df.columns else "?"
     m1, m2 = st.columns(2)
-    m1.metric("Census Tracts", f"{n_tracts:,}")
-    m2.metric("Counties", f"{n_counties}")
+    with m1:
+        st.metric("Census Tracts", f"{n_tracts:,}")
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_WIP_TRACT_ROW_COUNT)
+    with m2:
+        st.metric("Counties", f"{n_counties}")
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_WIP_COUNTY_COUNT)
 
     # ── Single-tract selector + run buttons ───────────────────────────────────
     sorted_tracts = sorted(df.index.unique())
@@ -2645,9 +3507,26 @@ def _render_wip_explorer_tab() -> None:
         mean_p = np.mean(probs)
         st.markdown(f"#### Results for {selected_tract}")
         r1, r2, r3 = st.columns(3)
-        r1.metric("Mean probability", f"{mean_p:.2%}")
-        r2.metric("Median probability", f"{np.median(probs):.2%}")
-        r3.metric("Std deviation", f"{np.std(probs):.3f}")
+        with r1:
+            st.metric(
+                "Mean acceptance (tract, sim draws)",
+                f"{mean_p:.2%}",
+                help=_WIP_SINGLE_TRACT_MEAN_ACCEPTANCE_HELP,
+            )
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_SINGLE_TRACT_ACCEPTANCE)
+        with r2:
+            st.metric(
+                "Median acceptance (tract, sim draws)",
+                f"{np.median(probs):.2%}",
+                help=_WIP_SINGLE_TRACT_MEAN_ACCEPTANCE_HELP,
+            )
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_SINGLE_TRACT_ACCEPTANCE)
+        with r3:
+            st.metric("Std deviation (sim draws)", f"{np.std(probs):.3f}")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_TRACT_DRAWS_STD)
 
         fig1, ax1 = plt.subplots(figsize=(10, 4))
         ax1.hist(probs, bins=50, density=True, color="skyblue", edgecolor="black")
@@ -2689,10 +3568,22 @@ def _render_wip_explorer_tab() -> None:
         all_p = list(tract_results.values())
         min_p, max_p = min(all_p), max(all_p)
         s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Mean", f"{np.mean(all_p):.2%}")
-        s2.metric("Median", f"{np.median(all_p):.2%}")
-        s3.metric("Min", f"{min_p:.2%}")
-        s4.metric("Max", f"{max_p:.2%}")
+        with s1:
+            st.metric("Mean", f"{np.mean(all_p):.2%}")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_STATEWIDE_MEAN)
+        with s2:
+            st.metric("Median", f"{np.median(all_p):.2%}")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_STATEWIDE_MEDIAN)
+        with s3:
+            st.metric("Min", f"{min_p:.2%}")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_STATEWIDE_MIN)
+        with s4:
+            st.metric("Max", f"{max_p:.2%}")
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_WIP_STATEWIDE_MAX)
 
         fig_d, ax_d = plt.subplots(figsize=(12, 5))
         ax_d.hist(all_p, bins=30, density=True, color="lightblue", edgecolor="navy", alpha=0.7)
@@ -2726,7 +3617,10 @@ def _render_wip_explorer_tab() -> None:
             st.info("Shapefile could not be loaded — choropleth unavailable.")
 
         # Top / bottom tracts
-        res_s = pd.Series(tract_results, name="Mean acceptance probability")
+        res_s = pd.Series(
+            tract_results,
+            name="Mean acceptance (tract avg., propensity sim draws)",
+        )
         t1, t2 = st.columns(2)
         with t1:
             st.markdown("**Top 10 tracts**")
@@ -2737,7 +3631,7 @@ def _render_wip_explorer_tab() -> None:
 
         export_df = pd.DataFrame({
             "tract": list(tract_results.keys()),
-            "mean_acceptance_probability": list(tract_results.values()),
+            "mean_acceptance_tract_avg_propensity_sim": list(tract_results.values()),
         })
         st.download_button(
             "Download results as CSV",
@@ -2779,6 +3673,19 @@ def _render_wip_explorer_tab() -> None:
                                key="wip_floor")
         n_ensemble = st.slider("M4 ensemble runs", 20, 300, 100, 10,
                                 disabled=(integration_method != "mc_ensemble"), key="wip_ens")
+        wip_dice_never = st.checkbox(
+            "M2/M4: no re-entry after failed year",
+            value=bool(st.session_state.get("wip_dice_reentry_never", True)),
+            key="wip_dice_reentry_never",
+            disabled=(integration_method not in ("dice_roll", "mc_ensemble")),
+        )
+        wip_dice_n = st.slider(
+            "M2/M4: years to re-entry",
+            1, 20, 1, 1,
+            key="wip_dice_reentry_years",
+            disabled=wip_dice_never or (integration_method not in ("dice_roll", "mc_ensemble")),
+            help="After a year where a building could adopt but does not, wait this many years before the next draw.",
+        )
 
     # Adoption curve reference chart
     fig_ac, ax_ac = plt.subplots(figsize=(10, 4))
@@ -2813,18 +3720,39 @@ def _render_wip_explorer_tab() -> None:
 
             with st.spinner("Running propensity integration…"):
                 ensemble_lo = ensemble_hi = None
+                wip_reentry: int | None
+                if wip_dice_never:
+                    wip_reentry = None
+                else:
+                    wip_reentry = int(wip_dice_n)
+                st.session_state["wip_dice_reentry_never"] = wip_dice_never
+                st.session_state["wip_dice_reentry_years"] = int(wip_dice_n)
                 if integration_method == "set_threshold":
                     aby = _wip_integrate_threshold(tract_prop, curve, years_list, thr)
                     aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
                 elif integration_method == "dice_roll":
-                    aby = _wip_integrate_dice(tract_prop, curve, years_list, np.random.default_rng(42), floor=fl)
+                    aby = _wip_integrate_dice(
+                        tract_prop,
+                        curve,
+                        years_list,
+                        np.random.default_rng(42),
+                        floor=fl,
+                        dice_reentry_years=wip_reentry,
+                    )
                     aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
                 elif integration_method == "ranked_distribution":
                     aby = _wip_integrate_ranked(tract_prop, curve, years_list, fl)
                     aggregate_pct = _wip_cumulative_pct(aby, years_list, n_tot)
                 else:
                     aggregate_pct, ensemble_lo, ensemble_hi, _ = _wip_integrate_ensemble(
-                        tract_prop, curve, years_list, n_ensemble, fl, seed=0)
+                        tract_prop,
+                        curve,
+                        years_list,
+                        n_ensemble,
+                        fl,
+                        seed=0,
+                        dice_reentry_years=wip_reentry,
+                    )
 
             fig_ar, ax_ar = plt.subplots(figsize=(12, 5))
             ax_ar.plot(years_list, aggregate_pct, color="#2563eb", lw=2.5, label="Cumulative adoption %")
@@ -2928,13 +3856,30 @@ def _render_scenario_kpis(data: dict, label: str) -> None:
     """Display summary KPI metrics for a saved scenario."""
     meta = data.get("metadata", {})
     cols = st.columns(4)
-    cols[0].metric("Scenario", label)
+    with cols[0]:
+        st.metric("Scenario", label)
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_SAVED_SCENARIO_NAME)
     n_bldg = meta.get("n_buildings")
-    cols[1].metric("Buildings", f"{n_bldg:,}" if n_bldg else "—")
+    with cols[1]:
+        st.metric("Buildings", f"{n_bldg:,}" if n_bldg else "—")
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_BUILDINGS_MODELLED)
     mean_acc = meta.get("mean_acceptance_probability")
-    cols[2].metric("Mean acceptance prob.", f"{mean_acc:.1%}" if mean_acc is not None else "—")
+    mean_acc_def = meta.get("mean_acceptance_probability_definition")
+    with cols[2]:
+        st.metric(
+            MEAN_ACCEPTANCE_AGGREGATE_LABEL,
+            f"{mean_acc:.1%}" if mean_acc is not None else "—",
+            help=mean_acc_def or MEAN_ACCEPTANCE_AGGREGATE_DESCRIPTION,
+        )
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_MEAN_ACCEPTANCE_AGGREGATE)
     saved_at = meta.get("saved_at", "—")
-    cols[3].metric("Saved", saved_at[:10] if saved_at != "—" else "—")
+    with cols[3]:
+        st.metric("Saved", saved_at[:10] if saved_at != "—" else "—")
+        with st.expander("Definition & formula", expanded=False):
+            st.markdown(_FORMULA_MD_SAVED_AT)
 
 
 def _render_visualize_tab() -> None:

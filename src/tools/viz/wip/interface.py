@@ -16,6 +16,8 @@ from __future__ import annotations
 import io
 import json
 import copy
+import os
+import time
 from functools import reduce
 from pathlib import Path
 from typing import Any
@@ -577,7 +579,7 @@ def _render_emissions_tab() -> None:
 # ── Tab 4: Run Models ──────────────────────────────────────────────────────────
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_CENSUS_API_KEY = "e865d3af152108cb504df27535d196f586c21729"
+_CENSUS_API_KEY = os.environ.get("CENSUS_API_KEY", "e865d3af152108cb504df27535d196f586c21729")
 
 _US_STATES: dict[str, str] = {
     "Alabama": "01", "Alaska": "02", "Arizona": "04", "Arkansas": "05",
@@ -685,6 +687,25 @@ _HH_SIZE_COLS = [
 
 # ── Census API helpers ────────────────────────────────────────────────────────
 
+def _census_get_resilient(url: str, params: dict, *, read_timeout: int = 300) -> requests.Response:
+    last_exc: BaseException | None = None
+    for attempt in range(4):
+        try:
+            resp = requests.get(url, params=params, timeout=(30, read_timeout))
+        except requests.RequestException as exc:
+            last_exc = exc
+            if attempt < 3:
+                time.sleep(min(2.0 * (2**attempt), 30.0))
+            continue
+        if resp.status_code in (502, 503, 504) and attempt < 3:
+            time.sleep(min(2.0 * (2**attempt), 30.0))
+            continue
+        return resp
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("census request failed with no response")
+
+
 @st.cache_data(show_spinner=False, ttl=86400)
 def _fetch_census_acs(state_fips: str) -> pd.DataFrame | None:
     """Fetch ACS 5-year tract-level data for a state and merge all variable chunks."""
@@ -698,9 +719,12 @@ def _fetch_census_acs(state_fips: str) -> pd.DataFrame | None:
             "key": _CENSUS_API_KEY,
         }
         try:
-            resp = requests.get(url, params=params, timeout=60)
+            resp = _census_get_resilient(url, params)
         except requests.RequestException as exc:
-            st.error(f"Census API request failed: {exc}")
+            st.error(
+                f"Census API request failed after retries: {exc}. "
+                "Try again in a moment, pick a smaller state, or set CENSUS_API_KEY for higher rate limits."
+            )
             return None
         if resp.status_code != 200:
             st.error(f"Census API error (HTTP {resp.status_code}): {resp.text[:300]}")
@@ -723,10 +747,10 @@ def _fetch_census_acs(state_fips: str) -> pd.DataFrame | None:
 def _fetch_county_names(state_fips: str) -> dict[str, str]:
     """Return {county_fips_3digit: county_name} for a state."""
     try:
-        resp = requests.get(
+        resp = _census_get_resilient(
             "https://api.census.gov/data/2020/dec/pl",
-            params={"get": "NAME", "for": "county:*", "in": f"state:{state_fips}", "key": _CENSUS_API_KEY},
-            timeout=30,
+            {"get": "NAME", "for": "county:*", "in": f"state:{state_fips}", "key": _CENSUS_API_KEY},
+            read_timeout=120,
         )
     except requests.RequestException:
         return {}

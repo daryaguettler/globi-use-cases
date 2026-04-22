@@ -14,10 +14,12 @@ set_threshold (default)
     the curve.
 
 dice_roll
-    No hard threshold.  Each year every non-adopted building draws
-    ``u ~ Uniform(0, 1)``; if ``acceptance_probability > u`` it becomes a
-    candidate.  Among candidates, highest propensity fills first up to the
-    curve target.  Remaining candidates roll again next year.
+    No hard threshold.  Each year, buildings that are still eligible to draw
+    (not yet adopted) draw ``u ~ Uniform(0, 1)``; if ``acceptance_probability > u``
+    they become candidates.  Among candidates, highest propensity fills first up to
+    the curve target.  Buildings that do not adopt may re-enter the eligible pool
+    after ``dice_reentry_years`` calendar years, or never if
+    ``dice_reentry_years is None`` (sampling without replacement on failure).
 
 ranked_distribution
     Soft floor threshold.  Buildings below ``floor_threshold`` are excluded;
@@ -62,6 +64,9 @@ from __future__ import annotations
 
 import json
 import logging
+
+from use_cases.apply_propensity import MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION
+
 from pydantic import BaseModel, ConfigDict, Field
 from pathlib import Path
 from typing import Any
@@ -210,14 +215,24 @@ def method_dice_roll(
     rng: np.random.Generator | None = None,
     floor_threshold: float = 0.0,
     attrition_rate: float = 0.0,
+    dice_reentry_years: int | None = 1,
     building_id_col: str = "building_id",
     propensity_col: str = "acceptance_probability",
     scenario_col: str = "retrofit.scenario",
 ) -> pd.Series:
     """Bernoulli dice-roll method.
 
-    Each year, non-adopted buildings draw u~U(0,1).  Those with
-    propensity > u become candidates; highest propensity fills first.
+    If ``dice_reentry_years is None`` (no re-entry): the first time a year has
+    positive need, every not-yet-classified building draws u once; if propensity
+    > u it stays in the *willing* pool, otherwise it is out forever.  On each
+    following year, only ranked allocation happens among the willing, highest
+    propensity first, until the curve is satisfied.  No second willingness draw
+    — so long-run adoption follows the minimum of the scenario curve and the
+    implied willing share (related to mean acceptance in expectation).
+
+    If ``dice_reentry_years`` is an int: each year each eligible building draws
+    u; failing defers a retry by that many years; passing the draw but missing
+    the annual quota is rolled again the next time eligible.
 
     attrition_rate is a last-minute dropout noise term: each year, a fraction
     drawn from Uniform(0, attrition_rate) of the buildings that would have
@@ -241,12 +256,63 @@ def method_dice_roll(
     adopted_set: set[str] = set()
     year_counts: dict[int, int] = dict.fromkeys(years, 0)
     adopted_so_far = 0
+    excluded_forever: set[str] = set()
+    # first calendar year a building may roll again (after a failed year with need>0)
+    next_eligible_year: dict[str, int] = {}
+    reentry_gap: int | None
+    if dice_reentry_years is None:
+        reentry_gap = None
+    else:
+        reentry_gap = max(1, int(dice_reentry_years))
+    # no re-entry: one draw per building for willingness, then only ranked fills
+    tried_roll: set[str] = set()
+    willing: set[str] = set()
+
     for year in years:
         target_n = int(n * curve.get(year, 0.0))
         need = max(0, target_n - adopted_so_far)
         if need == 0:
             continue
-        eligible = [b for b in all_bids if b not in adopted_set]
+
+        if reentry_gap is None:
+            still = [
+                b
+                for b in all_bids
+                if b not in adopted_set and b not in excluded_forever
+            ]
+            if not still and not (willing - adopted_set):
+                break
+            for b in still:
+                if b in tried_roll:
+                    continue
+                u = float(resolved_rng.uniform(0, 1))
+                tried_roll.add(b)
+                if propensity[b] > u:
+                    willing.add(b)
+                else:
+                    excluded_forever.add(b)
+            pool = sorted(
+                [b for b in willing if b not in adopted_set],
+                key=lambda b: propensity[b],
+                reverse=True,
+            )
+            n_to_adopt = min(need, len(pool))
+            if attrition_rate > 0.0 and n_to_adopt > 0:
+                dropout_fraction = resolved_rng.uniform(0.0, attrition_rate)
+                n_to_adopt = max(0, n_to_adopt - int(n_to_adopt * dropout_fraction))
+            for bid in pool[:n_to_adopt]:
+                adopted_set.add(bid)
+                year_counts[year] += 1
+                adopted_so_far += 1
+            continue
+
+        eligible = [
+            b
+            for b in all_bids
+            if b not in adopted_set
+            and b not in excluded_forever
+            and year >= next_eligible_year.get(b, 0)
+        ]
         if not eligible:
             break
         draws = resolved_rng.uniform(0, 1, len(eligible))
@@ -259,10 +325,15 @@ def method_dice_roll(
         if attrition_rate > 0.0 and n_to_adopt > 0:
             dropout_fraction = resolved_rng.uniform(0.0, attrition_rate)
             n_to_adopt = max(0, n_to_adopt - int(n_to_adopt * dropout_fraction))
+        adopted_ids = set(candidates[:n_to_adopt])
         for bid in candidates[:n_to_adopt]:
             adopted_set.add(bid)
             year_counts[year] += 1
             adopted_so_far += 1
+        for bid in eligible:
+            if bid in adopted_ids:
+                continue
+            next_eligible_year[bid] = year + reentry_gap
     return pd.Series(year_counts).cumsum() / n * 100
 
 
@@ -311,6 +382,7 @@ def method_mc_ensemble(
     n_runs: int = 100,
     floor_threshold: float = 0.0,
     attrition_rate: float = 0.0,
+    dice_reentry_years: int | None = 1,
     seed: int = 0,
     ci_low: float = 10.0,
     ci_high: float = 90.0,
@@ -328,6 +400,8 @@ def method_mc_ensemble(
         n_runs: Number of dice-roll repetitions.
         floor_threshold: Minimum propensity below which buildings are excluded.
         attrition_rate: Last-minute dropout noise (see method_dice_roll).
+        dice_reentry_years: See ``method_dice_roll``; use ``None`` for no re-entry
+            after a failed year.
         seed: Base seed for child RNGs.
         ci_low: Lower percentile for the confidence band (default 10).
         ci_high: Upper percentile for the confidence band (default 90).
@@ -349,6 +423,7 @@ def method_mc_ensemble(
             rng=np.random.default_rng(int(s)),
             floor_threshold=floor_threshold,
             attrition_rate=attrition_rate,
+            dice_reentry_years=dice_reentry_years,
             building_id_col=building_id_col,
             propensity_col=propensity_col,
             scenario_col=scenario_col,
@@ -384,6 +459,10 @@ class AdoptionEngine(BaseModel):
         n_ensemble_runs: Number of dice-roll runs for ``mc_ensemble``.
         random_seed: RNG seed for stochastic methods.
         income_brackets: Income bracket names used in net cost columns.
+        dice_reentry_years: For ``dice_roll`` / ``mc_ensemble``, calendar years
+            to wait after a non-adopting year before a building can draw again;
+            ``None`` = never re-eligible (without replacement on failure). Default
+            ``1`` matches legacy one roll per year for still-eligible buildings.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -401,6 +480,7 @@ class AdoptionEngine(BaseModel):
     end_year: int = 2050
     n_ensemble_runs: int = 100
     random_seed: int = 42
+    dice_reentry_years: int | None = 1
     income_brackets: list[str] = Field(default_factory=lambda: ["IncomeEligible", "AllCustomers"])
 
     # Computed fields (set in model_post_init)
@@ -437,6 +517,9 @@ class AdoptionEngine(BaseModel):
         self.end_year = int(uptake_cfg.get("end_year", self.end_year))
         self.n_ensemble_runs = int(uptake_cfg.get("n_ensemble_runs", self.n_ensemble_runs))
         self.random_seed = int(uptake_cfg.get("random_seed", self.random_seed))
+        if "dice_reentry_years" in uptake_cfg:
+            drv = uptake_cfg["dice_reentry_years"]
+            self.dice_reentry_years = None if drv is None else int(drv)
         self.threshold_by_scenario = uptake_cfg.get("threshold_by_scenario", {})
 
         # Load propensity data
@@ -580,6 +663,7 @@ class AdoptionEngine(BaseModel):
                     rng=rng,
                     floor_threshold=self.floor_threshold,
                     attrition_rate=attrition,
+                    dice_reentry_years=self.dice_reentry_years,
                 )
                 self._append_yearly_rows(
                     yearly_rows, scenario, series, n, method="dice_roll"
@@ -607,6 +691,7 @@ class AdoptionEngine(BaseModel):
                     seed=self.random_seed,
                     floor_threshold=self.floor_threshold,
                     attrition_rate=attrition,
+                    dice_reentry_years=self.dice_reentry_years,
                 )
                 self._append_yearly_rows(
                     yearly_rows,
@@ -680,7 +765,9 @@ class AdoptionEngine(BaseModel):
             "adoption_scenario": self.adoption_scenario_name,
             "acceptance_threshold": self.acceptance_threshold,
             "floor_threshold": self.floor_threshold,
+            "dice_reentry_years": self.dice_reentry_years,
             "time_horizon": {"start_year": self.start_year, "end_year": self.end_year},
+            "mean_acceptance_probability_definition": MEAN_ACCEPTANCE_MEAN_WITHIN_RETROFIT_SCENARIO_DEFINITION,
             "by_scenario": {},
         }
         for scenario in scenarios:
