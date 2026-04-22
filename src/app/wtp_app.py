@@ -49,16 +49,17 @@ from app.analysis.energy_delta import (
     DEFAULT_ENERGY_PRICES,
     FUEL_LABELS,
     build_policy_impacts,
+    flatten_energy_parquet,
+    footprint_geometry_summary,
     load_energy_parquet,
+    normalize_epsg_code,
+    resolved_rotated_rectangle_epsg,
+    rotated_rectangle_column,
 )
 from app.analysis.adoption_breakdown import (
     build_adoption_cohort_by_demographics,
-    count_adopters_with_positive_incentive,
-    expected_incentive_sum_on_adopted_cohort,
-    last_year_uptake_row,
-    n_adopters_from_yearly_row,
-    ranking_displacement_at_equal_n,
-    resolve_retrofit_scenario_name,
+    build_adoption_finance_breakdown_dataframe,
+    pick_adoption_scenario_for_cohort_breakdown,
 )
 from app.analysis.emissions_calc import compute_emissions_trajectory
 from use_cases.apply_propensity import (
@@ -194,23 +195,27 @@ Each point is one building: **x** = annual energy cost savings (\$/yr), **y** = 
 """
 
 _FORMULA_MD_PORTFOLIO_RETROFIT_AND_INCENTIVE = r"""
-### Total gross retrofit cost (portfolio)
+### Total gross retrofit cost (adopted cohort)
 
-Sum of **gross_upfront_usd** over all propensity rows in the with-incentive run. Each row is one building (or building–retrofit) using the same upfront cost field as the WTP model: \texttt{net\_cost.AllCustomers} or \texttt{cost.Total} (see propensity code). **Incentive pricing does not change** this — it is the gross **deal** cost before the income draw subtracts a subsidy in the logit.
-
-$$
-C_{\mathrm{gross}} = \sum_i \text{gross\_upfront\_usd}_i
-$$
-
-### Total expected incentives (portfolio)
-
-**Residential:** For each building, given census income draws, the incentive in USD in each draw is the tier’s configured flat amount. The column **expected_incentive_usd** is the mean of those draws. **Commercial** rows are 0.
+For each **adoption curve**, let \(n\) be the final-year adopter count from uptake (mean cumulative % \(\times\) **n_buildings**), with adopters = top \(n\) buildings by **with-incentive** `acceptance_probability`. **Gross cost on cohort** is the sum of **gross_upfront_usd** over those \(n\) rows (same field as the WTP model: \texttt{net\_cost.AllCustomers} or \texttt{cost.Total}).
 
 $$
-S_{\mathrm{exp}} = \sum_i \text{expected\_incentive\_usd}_i
+C_{\mathrm{cohort}}(a) = \sum_{i \in \mathrm{top}_n(a)} \text{gross\_upfront\_usd}_i
 $$
 
-This is an **unweighted portfolio expectation** of subsidy outlay (not divided by adoption uptake; not conditional on a household accepting the deal). If every row in the table were a full retrofit at the assigned tier’s incentive, the implied average budget for incentives would scale with this sum. Optional attrition: compare to adoption-weighted outlay in downstream analysis if needed.
+The KPI shows **min–max** of \(C_{\mathrm{cohort}}(a)\) across adoption scenarios \(a\) in your run.
+
+### Total expected incentives (adopted cohort)
+
+**Residential:** **expected_incentive_usd** is the mean incentive draw per building. **Commercial** rows are 0. On the same top-\(n\) cohort:
+
+$$
+S_{\mathrm{cohort}}(a) = \sum_{i \in \mathrm{top}_n(a)} \text{expected\_incentive\_usd}_i
+$$
+
+The KPI shows **min–max** of \(S_{\mathrm{cohort}}(a)\) across scenarios. This is **adoption-weighted** (only buildings counted as adopters for that curve), not the sum over the full stock.
+
+**Incentives given** in the per-scenario table = count of adopters with **expected_incentive_usd** \(> 0\). **Avg incentive (recipients)** = sum of positive **expected_incentive_usd** on the cohort \(\div\) that count (0 if none).
 """
 
 _FORMULA_MD_ADOPTION_DEMO_BREAKDOWN = r"""
@@ -225,6 +230,8 @@ _FORMULA_MD_ADOPTION_DEMO_BREAKDOWN = r"""
 We compare the top \(n\) building ids by with-incentive propensity vs. the top \(n\) by no-incentive propensity for \(n = \min(n_{\text{no inc}}, n_{\text{inc}})\) from the two runs’ final cumulative %. **Replaced in rank** = \(|S_{\text{inc}} \setminus S_{\text{base}}|\) (same as \(|S_{\text{base}} \setminus S_{\text{inc}}|\) when \(|S|=n\) and ids are unique).
 
 **Expected incentives on the adopted cohort** = sum of `expected_incentive_usd` (mean draw per building from the with-incentive propensity run) over building ids in the with-incentive top-\(n_{\text{inc}}\) set.
+
+**Gross cost on the adopted cohort** = sum of `gross_upfront_usd` over the same ids. **Incentives given** = count of those adopters with `expected_incentive_usd` \(> 0\); **avg $ / recipient** uses only the positive amounts in that sum.
 """
 
 _FORMULA_MD_SAVED_SCENARIO_NAME = r"""
@@ -332,6 +339,35 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+_FOOTPRINT_CRS_OPTIONS: list[tuple[str, str]] = [
+    ("auto", "Auto (env vars + file heuristics)"),
+    ("EPSG:3857", "EPSG:3857 — Web Mercator (typical P3 WKB)"),
+    ("EPSG:4326", "EPSG:4326 — WGS 84 / geographic degrees"),
+]
+for _z in range(10, 20):
+    _code = f"EPSG:{32600 + _z}"
+    _FOOTPRINT_CRS_OPTIONS.append((_code, f"{_code} — UTM zone {_z}N"))
+_FOOTPRINT_CRS_OPTIONS.append(("custom", "Custom EPSG…"))
+
+
+def _resolve_session_footprint_epsg() -> str | None:
+    ch = st.session_state.get("footprint_crs_choice", "auto")
+    if ch == "auto":
+        return None
+    if ch == "custom":
+        raw = (st.session_state.get("footprint_crs_custom") or "").strip()
+        return normalize_epsg_code(raw) if raw else None
+    return ch
+
+
+def _load_energy_with_session_crs(source: str | bytes) -> pd.DataFrame:
+    return load_energy_parquet(
+        source,
+        footprint_crs=_resolve_session_footprint_epsg(),
+        rewrite_footprints_wgs84=bool(st.session_state.get("rewrite_footprints_wgs84", False)),
+    )
+
+
 _STATE_DEFAULTS: dict = {
     # {year: {"baseline": bytes, "scenario": bytes}} — one pair per simulated year
     "year_files": {},
@@ -347,6 +383,9 @@ _STATE_DEFAULTS: dict = {
     "run_complete": False,
     "dice_reentry_never": True,
     "wip_dice_reentry_never": True,
+    "footprint_crs_choice": "auto",
+    "footprint_crs_custom": "",
+    "rewrite_footprints_wgs84": False,
 }
 for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
@@ -996,6 +1035,66 @@ def _render_upload_tab() -> None:
 
     st.session_state["year_files"] = year_files
 
+    # ── Footprint CRS (reference baseline) ────────────────────────────────────
+    st.divider()
+    st.markdown("### Building footprint CRS")
+    st.caption(
+        "rotated_rectangle may be WKB (Web Mercator) or WKT in projected metres (e.g. UTM). "
+        "Choose the CRS your files use, or leave Auto. Optional rewrite converts footprints "
+        "to WGS 84 WKT in memory for the rest of the session."
+    )
+    ref_yr_fp = None
+    for y in sorted(selected_years):
+        if year_files.get(y, {}).get("baseline"):
+            ref_yr_fp = y
+            break
+    if ref_yr_fp is None:
+        st.info("Upload a baseline file to inspect footprint geometry and set CRS.")
+    else:
+        try:
+            _fp_df = flatten_energy_parquet(year_files[ref_yr_fp]["baseline"])
+            finfo = footprint_geometry_summary(_fp_df)
+        except Exception as exc:
+            finfo = {"error": str(exc)}
+        if finfo.get("error"):
+            st.warning(f"Could not read footprint metadata: {finfo['error']}")
+        elif not finfo.get("has_footprint"):
+            st.info("No rotated_rectangle column in the reference baseline.")
+        else:
+            bx = finfo["bounds"]
+            st.markdown(
+                f"**Reference baseline (year {ref_yr_fp})** — `{finfo['column']}`, "
+                f"encoding **{finfo['encoding']}**, bounds "
+                f"({bx[0]:,.2f}, {bx[1]:,.2f}, {bx[2]:,.2f}, {bx[3]:,.2f})."
+            )
+            st.markdown(f"**Hint:** {finfo['structural_hint']}")
+            st.caption(
+                f"Auto-resolved EPSG (with current env): **{finfo['auto_resolved_epsg']}**. "
+                f"GLOBI_ROTATED_RECTANGLE_CRS is {'set' if finfo['env_globi_crs_set'] else 'unset'}; "
+                f"GLOBI_UTM_ZONE_N is {'set' if finfo['env_utm_zone_set'] else 'unset'}."
+            )
+    _fc_opts = [o[0] for o in _FOOTPRINT_CRS_OPTIONS]
+    _fc_lbl = dict(_FOOTPRINT_CRS_OPTIONS)
+    if st.session_state.get("footprint_crs_choice") not in _fc_opts:
+        st.session_state["footprint_crs_choice"] = "auto"
+    st.selectbox(
+        "Footprint source CRS",
+        options=_fc_opts,
+        format_func=lambda k: _fc_lbl[k],
+        key="footprint_crs_choice",
+    )
+    if st.session_state.get("footprint_crs_choice") == "custom":
+        st.text_input(
+            "Custom EPSG",
+            key="footprint_crs_custom",
+            placeholder="32612 or EPSG:32612",
+        )
+    st.checkbox(
+        "Rewrite footprints to WGS 84 WKT after load (in memory only)",
+        key="rewrite_footprints_wgs84",
+        help="Projects using the CRS above once, then stores EPSG:4326 WKT for later steps.",
+    )
+
     # ── Validation summary ─────────────────────────────────────────────────────
     st.divider()
     complete = [y for y in selected_years if year_files.get(y, {}).get("baseline") and year_files.get(y, {}).get("scenario")]
@@ -1270,15 +1369,9 @@ def _render_census_tract_lookup() -> None:
                 import geopandas as gpd
                 from shapely import wkt as shapely_wkt
 
-                base_flat = load_energy_parquet(year_files[ref_yr]["baseline"])
+                base_flat = _load_energy_with_session_crs(year_files[ref_yr]["baseline"])
 
-                # Try rotated_rectangle WKT (EPSG:3857) first
-                rect_col = next(
-                    (c for c in ["rotated_rectangle", "GLOBI_ROTATED_RECTANGLE",
-                                 "feature.geometry.rotated_rectangle"]
-                     if c in base_flat.columns),
-                    None,
-                )
+                rect_col = rotated_rectangle_column(base_flat)
 
                 building_lats: list[float] = []
                 building_lons: list[float] = []
@@ -1300,7 +1393,13 @@ def _render_census_tract_lookup() -> None:
 
                     wkt_series = base_flat[rect_col].dropna().astype(str)
                     geoms = wkt_series.map(_load_geometry).dropna()
-                    gs = gpd.GeoSeries(geoms, crs="EPSG:3857").to_crs("EPSG:4326")
+                    if st.session_state.get("rewrite_footprints_wgs84"):
+                        rect_epsg = "EPSG:4326"
+                    else:
+                        rect_epsg = resolved_rotated_rectangle_epsg(
+                            base_flat, rect_col, user_crs=_resolve_session_footprint_epsg()
+                        )
+                    gs = gpd.GeoSeries(geoms, crs=rect_epsg).to_crs("EPSG:4326")
                     centroids = gs.centroid
                     building_lons = centroids.x.tolist()
                     building_lats = centroids.y.tolist()
@@ -1901,8 +2000,8 @@ def _run_pipeline(simulated_years: list[int]) -> None:
     for yr_idx, yr in enumerate(simulated_years):
         try:
             entry = year_files[yr]
-            base_flat = load_energy_parquet(entry["baseline"])
-            scen_flat = load_energy_parquet(entry["scenario"])
+            base_flat = _load_energy_with_session_crs(entry["baseline"])
+            scen_flat = _load_energy_with_session_crs(entry["scenario"])
             pi = build_policy_impacts(
                 baseline_df=base_flat,
                 scenario_df=scen_flat,
@@ -1927,7 +2026,10 @@ def _run_pipeline(simulated_years: list[int]) -> None:
     # ── 2. Census enrichment (US only) ───────────────────────────────────────
     if st.session_state.get("is_us", True) and st.session_state.get("census_csv_bytes") is None:
         if "lat" in policy_impacts.columns and "lon" in policy_impacts.columns:
-            progress.progress(30, text="Looking up census demographics (may take a moment)…")
+            progress.progress(
+                30,
+                text="Census enrichment: GEOID column or geocoder, then ACS (bundled state files when available)…",
+            )
             from app.analysis.census_lookup import enrich_with_census
             policy_impacts = enrich_with_census(
                 policy_impacts,
@@ -2434,6 +2536,8 @@ def _render_adoption_incentive_breakdown(
     scenario_results: dict,
     scenario_results_inc: dict,
     retrofit_name: str,
+    *,
+    precomputed: tuple[pd.DataFrame, str] | None = None,
 ) -> None:
     """Cohort by income/education; ranking displacement and incentive on adopted."""
     if (
@@ -2442,94 +2546,133 @@ def _render_adoption_incentive_breakdown(
     ):
         st.info("Adoption breakdown needs **acceptance_probability** on policy impacts (re-run analysis).")
         return
-    keys_i = [k for k in scenario_results_inc if scenario_results.get(k)]
-    if not keys_i:
+    if precomputed is not None:
+        tbl, r_label = precomputed
+    else:
+        tbl, r_label = build_adoption_finance_breakdown_dataframe(
+            policy_base,
+            policy_inc,
+            prop_inc.data,
+            scenario_results,
+            scenario_results_inc,
+            retrofit_name,
+        )
+    if tbl is None or tbl.empty:
+        st.info(
+            "Adoption cohort breakdown needs at least one adoption scenario present in both "
+            "the baseline and incentive runs. Re-run the analysis."
+        )
         return
-    ad_name = keys_i[0]
-    yb = scenario_results[ad_name]["uptake"].yearly_summary
-    yi = scenario_results_inc[ad_name]["uptake"].yearly_summary
-    # session scenario_name can differ from what was written to policy/ propensity
-    r_label = resolve_retrofit_scenario_name(policy_inc, retrofit_name)
-    row_b = last_year_uptake_row(yb, ad_name, r_label)
-    row_i = last_year_uptake_row(yi, ad_name, r_label)
-    n_b = n_adopters_from_yearly_row(row_b) if row_b is not None else 0
-    n_i = n_adopters_from_yearly_row(row_i) if row_i is not None else 0
-    cum_b = float(row_b.get("cumulative_adoption_pct", 0.0) or 0.0) if row_b is not None else 0.0
-    cum_i = float(row_i.get("cumulative_adoption_pct", 0.0) or 0.0) if row_i is not None else 0.0
-    n_w_incentive = count_adopters_with_positive_incentive(
-        policy_inc, "acceptance_probability", n_i, prop_inc.data, min_usd=0.0
-    )
-    n_eq = min(n_b, n_i)
+    keys_i = tbl["adoption_scenario"].astype(str).tolist()
+    rows = tbl.to_dict("records")
+    tot_s = _sum_portfolio_retrofit_and_incentive(prop_inc.data)[1]
 
     st.markdown("### Adoption cohort & incentive lift")
     st.caption(
-        f"**Retrofit label used:** “{r_label}”  |  **Adoption curve:** `{ad_name}`. "
-        "If you renamed the retrofit after the run, we match from policy data. "
-        "Counts = mean uptake path ×**n_buildings** in that run (same as emissions). "
-        "“Use incentives” = adopters in the retrofit cohort with **expected_incentive_usd** > 0 "
-        "(residential only get non-zero in the model; commercial counts as 0 here)."
+        f"**Retrofit label:** “{r_label}”. One row per **adoption curve** ({len(keys_i)} scenario(s)). "
+        "Adopters = final-year mean uptake × **n_buildings**. "
+        "**Incentives given** = adopters with **expected_incentive_usd** > 0. "
+        "**Gross cost** / **expected $** columns sum **gross_upfront_usd** and all **expected_incentive_usd** on the adopted cohort (not the full stock). "
+        "Demographic charts below use the scenario you select."
     )
     with st.expander("Definition & formula — adoption cohort & incentive lift", expanded=False):
         st.markdown(_FORMULA_MD_ADOPTION_DEMO_BREAKDOWN)
 
-    mcols = st.columns(2)
-    if row_b is None and row_i is None:
+    if not all(r["row_ok"] for r in rows):
+        bad = [r["adoption_scenario"] for r in rows if not r["row_ok"]]
         st.warning(
-            f"No **yearly_summary** row matched (adoption `{ad_name}`, retrofit `{r_label}`). "
-            "If you renamed the retrofit scenario in the app, re-run the analysis. "
+            f"No **yearly_summary** match for retrofit `{r_label}` on: {', '.join(bad)}. "
+            "Re-run if you renamed the retrofit."
         )
-    mcols[0].metric(
-        "Buildings that retrofit (with incentive run, final year, mean path)",
-        f"{n_i:,}" if row_i is not None else "—",
-        help=(
-            f"round(cumulative % × n_buildings) in uptake; here ≈{cum_i:.1f}% and "
-            f"n_bld={int(row_i.get('n_buildings', 0) or 0)}"
-        )
-        if row_i is not None
-        else "no matching row",
-    )
-    mcols[1].metric(
-        "Of those, with a positive program incentive (expected, mean draw)",
-        f"{n_w_incentive:,}" if row_i is not None else "—",
-        help="Among top n_i by with-incentive propensity; count expected_incentive_usd > 0 on propensity data",
-    )
-    mcols2 = st.columns(3)
-    mcols2[0].metric(
-        "Buildings that retrofit (no incentive run)",
-        f"{n_b:,}" if row_b is not None else "—",
-        help=f"≈{cum_b:.1f}% cumulative" if row_b is not None else "no matching row",
-    )
-    mcols2[1].metric("Extra adopters (with − without)", f"{n_i - n_b:+,}", help="same adoption curve, different propensity")
-    if n_eq > 0 and n_b and n_i:
-        only_i, _only_b, _ovl = ranking_displacement_at_equal_n(
-            policy_inc["building.id"],
-            policy_base["acceptance_probability"],
-            policy_inc["acceptance_probability"],
-            n_eq,
-        )
-        mcols2[2].metric(
-            f"Re-ranked in top {n_eq} (same n, both runs)",
-            f"{only_i}",
-            help="How many of the n slots go to different buildings when ranking by with- vs no-incentive propensity",
-        )
-    else:
-        mcols2[2].metric("Re-ranked in top n", "—")
 
+    display_tbl = tbl[
+        [
+            "adoption_scenario",
+            "n_adopters_with_inc",
+            "n_positive_incentive",
+            "cohort_gross_cost_usd",
+            "cohort_expected_incentive_usd",
+            "avg_incentive_per_adopter_usd",
+            "avg_incentive_per_recipient_usd",
+            "n_adopters_no_inc",
+            "extra_adopters",
+            "cum_pct_with_inc",
+            "reranked_top_n",
+        ]
+    ].rename(
+        columns={
+            "adoption_scenario": "Adoption scenario",
+            "n_adopters_with_inc": "Adopters (w/ incentive)",
+            "n_positive_incentive": "Incentives given (n)",
+            "cohort_gross_cost_usd": "Gross cost (cohort)",
+            "cohort_expected_incentive_usd": "Expected $ (cohort)",
+            "avg_incentive_per_adopter_usd": "Avg $ / adopter",
+            "avg_incentive_per_recipient_usd": "Avg $ / recipient",
+            "n_adopters_no_inc": "Adopters (no incentive run)",
+            "extra_adopters": "Extra adopters (Δ)",
+            "cum_pct_with_inc": "Final cum. % (w/ inc.)",
+            "reranked_top_n": "Re-ranked @ min(n)",
+        }
+    )
+    display_tbl["Re-ranked @ min(n)"] = pd.to_numeric(
+        display_tbl["Re-ranked @ min(n)"], errors="coerce"
+    ).astype("Int64")
+    st.dataframe(
+        display_tbl,
+        column_config={
+            "Adoption scenario": st.column_config.TextColumn(width="medium"),
+            "Adopters (w/ incentive)": st.column_config.NumberColumn(format="%d"),
+            "Incentives given (n)": st.column_config.NumberColumn(format="%d"),
+            "Gross cost (cohort)": st.column_config.NumberColumn(format="$%d"),
+            "Expected $ (cohort)": st.column_config.NumberColumn(format="$%d"),
+            "Avg $ / adopter": st.column_config.NumberColumn(format="$%d"),
+            "Avg $ / recipient": st.column_config.NumberColumn(format="$%d"),
+            "Adopters (no incentive run)": st.column_config.NumberColumn(format="%d"),
+            "Extra adopters (Δ)": st.column_config.NumberColumn(format="%d"),
+            "Final cum. % (w/ inc.)": st.column_config.NumberColumn(format="%.1f"),
+            "Re-ranked @ min(n)": st.column_config.NumberColumn(format="%d", step=1),
+        },
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    inc_vals = tbl["cohort_expected_incentive_usd"].astype(float)
+    gross_vals = tbl["cohort_gross_cost_usd"].astype(float)
+    pos_vals = tbl["n_positive_incentive"].astype(int)
+    adop_inc = tbl["n_adopters_with_inc"].astype(int)
+    if len(keys_i) > 1:
+        st.caption(
+            f"**Across scenarios:** gross cost on cohort **${gross_vals.min():,.0f} – ${gross_vals.max():,.0f}**; "
+            f"expected incentive on cohort **${inc_vals.min():,.0f} – ${inc_vals.max():,.0f}**; "
+            f"incentives given (count) **{pos_vals.min():,} – {pos_vals.max():,}**; "
+            f"adopters (w/ incentive) **{adop_inc.min():,} – {adop_inc.max():,}**."
+        )
+    if tot_s is not None and tot_s > 0 and inc_vals.max() > 0:
+        st.caption(
+            f"Portfolio-wide expected incentive pool (all buildings, not adoption-weighted): **${tot_s:,.0f}**. "
+            "Cohort column is only the adopted subset."
+        )
+
+    default_chart = pick_adoption_scenario_for_cohort_breakdown(keys_i, scenario_results, r_label)
+    _chart_state_key = "adopt_demo_detail_scenario"
+    if _chart_state_key not in st.session_state or st.session_state[_chart_state_key] not in keys_i:
+        st.session_state[_chart_state_key] = default_chart if default_chart in keys_i else keys_i[0]
+    n_by_scen = dict(zip(tbl["adoption_scenario"].astype(str), tbl["n_adopters_with_inc"].astype(int)))
+    detail_scen = st.selectbox(
+        "Income / education charts for adoption scenario",
+        options=keys_i,
+        key=_chart_state_key,
+        format_func=lambda k: f"{k} (n={n_by_scen.get(str(k), 0):,} adopters)",
+    )
+    n_i = int(n_by_scen[str(detail_scen)])
     cohort = build_adoption_cohort_by_demographics(
         policy_inc, "acceptance_probability", n_i
     )
-    inc_cohort_usd = expected_incentive_sum_on_adopted_cohort(
-        policy_inc, "acceptance_probability", n_i, prop_inc.data
-    )
-    tot_s = _sum_portfolio_retrofit_and_incentive(prop_inc.data)[1]
-    if inc_cohort_usd is not None and tot_s is not None and tot_s > 0:
+    inc_cohort_usd = float(tbl.loc[tbl["adoption_scenario"].eq(detail_scen), "cohort_expected_incentive_usd"].iloc[0])
+    if tot_s is not None and tot_s > 0 and inc_cohort_usd > 0:
         st.caption(
-            f"**Expected incentives on the adopted cohort (with incentive):** ${inc_cohort_usd:,.0f} "
-            f"({100.0 * inc_cohort_usd / tot_s:.1f}% of the portfolio-expected total incentive pool)."
-        )
-    elif inc_cohort_usd is not None:
-        st.caption(
-            f"**Expected incentives on the adopted cohort (with incentive):** ${inc_cohort_usd:,.0f}."
+            f"**{detail_scen}** — expected incentives on adopted cohort: **${inc_cohort_usd:,.0f}** "
+            f"({100.0 * inc_cohort_usd / tot_s:.1f}% of portfolio pool)."
         )
 
     in_counts = cohort["income_counts"]
@@ -2547,13 +2690,13 @@ def _render_adoption_incentive_breakdown(
                 )
             )
             fig.update_layout(
-                title="Adopted cohort by income (tract-based, n=%d)" % n_i,
+                title="Adopted cohort by income — %s (n=%d)" % (detail_scen, n_i),
                 xaxis_title="",
                 yaxis_title="Buildings",
                 height=400,
                 margin=dict(t=40, b=80),
             )
-            fig.update_xaxis(tickangle=45)
+            fig.update_xaxes(tickangle=45)
             st.plotly_chart(fig, use_container_width=True, key="adopt_demo_income")
         else:
             st.caption("No income breakdown (missing tract `income_probs` on policy impacts).")
@@ -2568,13 +2711,13 @@ def _render_adoption_incentive_breakdown(
                 )
             )
             fig2.update_layout(
-                title="Adopted cohort by education (tract-based, n=%d)" % n_i,
+                title="Adopted cohort by education — %s (n=%d)" % (detail_scen, n_i),
                 xaxis_title="",
                 yaxis_title="Buildings",
                 height=400,
                 margin=dict(t=40, b=80),
             )
-            fig2.update_xaxis(tickangle=35)
+            fig2.update_xaxes(tickangle=35)
             st.plotly_chart(fig2, use_container_width=True, key="adopt_demo_edu")
         else:
             st.caption("No education breakdown (missing `education_probs`).")
@@ -2624,23 +2767,6 @@ def _render_result_charts() -> None:
             )
             with st.expander("Definition & formula", expanded=False):
                 st.markdown(_FORMULA_MD_MEAN_ACCEPTANCE_AGGREGATE)
-        tot_g, tot_s = _sum_portfolio_retrofit_and_incentive(propensity_result_inc.data)
-        if tot_g is not None:
-            kpi_cost = st.columns(2)
-            with kpi_cost[0]:
-                st.metric(
-                    "Total gross retrofit cost (portfolio)",
-                    f"${tot_g:,.0f}",
-                    help="sum of per-row upfront deal cost (USD); not net of incentives. see expander for formula.",
-                )
-            with kpi_cost[1]:
-                st.metric(
-                    "Total expected incentives (portfolio)",
-                    f"${tot_s:,.0f}",
-                    help="sum of mean draw incentive per building (USD); not adoption-weighted. see expander.",
-                )
-            with st.expander("Definition & formula — portfolio cost & incentives", expanded=False):
-                st.markdown(_FORMULA_MD_PORTFOLIO_RETROFIT_AND_INCENTIVE)
 
     # ── Summary table (base only) ──────────────────────────────────────────────
     summary_rows = []
@@ -2672,22 +2798,41 @@ def _render_result_charts() -> None:
         st.dataframe(pd.DataFrame(summary_rows).set_index("Adoption scenario"),
                      use_container_width=True)
 
-    if (
-        incentives_enabled
-        and st.session_state.get("policy_impacts_incentive") is not None
-        and propensity_result_inc
-        and scenario_results_inc
-    ):
-        st.divider()
-        _render_adoption_incentive_breakdown(
-            policy_base=policy_impacts,
-            policy_inc=st.session_state["policy_impacts_incentive"],
-            prop_base=propensity_result,
-            prop_inc=propensity_result_inc,
-            scenario_results=scenario_results,
-            scenario_results_inc=scenario_results_inc,
-            retrofit_name=retrofit_name,
-        )
+    # adoption cohort & incentive lift (table + demographics) — re-enable when ready to ship
+    # adoption_finance_precomputed = None
+    # if (
+    #     incentives_enabled
+    #     and st.session_state.get("policy_impacts_incentive") is not None
+    #     and propensity_result_inc
+    #     and scenario_results_inc
+    # ):
+    #     _af_tbl, _af_rl = build_adoption_finance_breakdown_dataframe(
+    #         policy_impacts,
+    #         st.session_state["policy_impacts_incentive"],
+    #         propensity_result_inc.data,
+    #         scenario_results,
+    #         scenario_results_inc,
+    #         retrofit_name,
+    #     )
+    #     if _af_tbl is not None and not _af_tbl.empty:
+    #         adoption_finance_precomputed = (_af_tbl, _af_rl)
+    # if (
+    #     incentives_enabled
+    #     and st.session_state.get("policy_impacts_incentive") is not None
+    #     and propensity_result_inc
+    #     and scenario_results_inc
+    # ):
+    #     st.divider()
+    #     _render_adoption_incentive_breakdown(
+    #         policy_base=policy_impacts,
+    #         policy_inc=st.session_state["policy_impacts_incentive"],
+    #         prop_base=propensity_result,
+    #         prop_inc=propensity_result_inc,
+    #         scenario_results=scenario_results,
+    #         scenario_results_inc=scenario_results_inc,
+    #         retrofit_name=retrofit_name,
+    #         precomputed=adoption_finance_precomputed,
+    #     )
 
     st.divider()
 

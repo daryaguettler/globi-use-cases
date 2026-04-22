@@ -185,6 +185,54 @@ def geocode_point(lat: float, lon: float, retries: int = 3) -> CensusGeocodeResu
     return None
 
 
+def parse_static_census_geoid(val: Any) -> CensusGeocodeResult | None:
+    """Parse an 11-digit census tract GEOID string into FIPS components."""
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = "".join(c for c in str(val).strip() if c.isdigit())
+    if len(s) < 11:
+        return None
+    s = s[:11]
+    return CensusGeocodeResult(state=s[:2], county=s[2:5], tract=s[5:11], geoid=s)
+
+
+_GEOID_SOURCE_COLUMNS: tuple[str, ...] = (
+    "building.tract_id",
+    "geoid",
+    "GEOID20",
+    "feature.location.tract_id",
+)
+
+
+def prefill_geocode_columns_from_tract_ids(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Set ``state_fips``, ``county_fips``, ``tract_fips``, ``geoid`` from a GEOID column.
+
+    Uses the first of :data:`_GEOID_SOURCE_COLUMNS` present in *df*. Rows that
+    already have ``geoid`` set are left unchanged. Returns ``(df, n_filled)``.
+    """
+    src = next((c for c in _GEOID_SOURCE_COLUMNS if c in df.columns), None)
+    if src is None:
+        return df, 0
+    for col in ("state_fips", "county_fips", "tract_fips", "geoid"):
+        if col not in df.columns:
+            df[col] = None
+    n = 0
+    for idx in df.index:
+        if pd.notna(df.at[idx, "geoid"]):
+            continue
+        parsed = parse_static_census_geoid(df.at[idx, src])
+        if not parsed:
+            continue
+        df.at[idx, "state_fips"] = parsed.state
+        df.at[idx, "county_fips"] = parsed.county
+        df.at[idx, "tract_fips"] = parsed.tract
+        df.at[idx, "geoid"] = parsed.geoid
+        n += 1
+    if n:
+        logger.info("Prefilled %s row(s) from column %r (Census Geocoder skipped for those).", n, src)
+    return df, n
+
+
 def batch_geocode(
     df: pd.DataFrame,
     lat_col: str = "lat",
@@ -193,6 +241,7 @@ def batch_geocode(
     sleep_between: float = 0.03,
     coord_round_decimals: int = 5,
     use_disk_cache: bool = True,
+    skip_rows_with_geoid: bool = False,
 ) -> pd.DataFrame:
     """Geocode a DataFrame of buildings, adding ``state_fips``, ``county_fips``,
     ``tract_fips``, and ``geoid`` columns.
@@ -209,6 +258,8 @@ def batch_geocode(
         sleep_between:  Seconds to sleep between distinct geocoder calls.
         coord_round_decimals: Decimal places for deduplicating coordinates (~1.1 m at 5).
         use_disk_cache: Persist / load results under ``outputs/census_cache/geocode_cache.json``.
+        skip_rows_with_geoid: If True, do not call the geocoder for rows that already
+            have a non-null ``geoid`` (e.g. prefilled from parquet).
 
     Returns:
         DataFrame with census columns added (NaN where lookup failed).
@@ -218,7 +269,8 @@ def batch_geocode(
 
     out = df.copy()
     for col in ["state_fips", "county_fips", "tract_fips", "geoid"]:
-        out[col] = None
+        if col not in out.columns:
+            out[col] = None
 
     if lat_col not in df.columns or lon_col not in df.columns:
         logger.warning(f"Lat/lon columns '{lat_col}'/'{lon_col}' not found; skipping geocoding.")
@@ -231,6 +283,9 @@ def batch_geocode(
     # group row indices by rounded coordinate → one API call per distinct location
     buckets: dict[tuple[float, float], list[Any]] = {}
     for i in range(rows_to_process):
+        idx = df.index[i]
+        if skip_rows_with_geoid and pd.notna(out.at[idx, "geoid"]):
+            continue
         lat = df[lat_col].iloc[i]
         lon = df[lon_col].iloc[i]
         try:
@@ -238,7 +293,7 @@ def batch_geocode(
         except (TypeError, ValueError):
             continue
         key = (round(lat_f, coord_round_decimals), round(lon_f, coord_round_decimals))
-        buckets.setdefault(key, []).append(df.index[i])
+        buckets.setdefault(key, []).append(idx)
 
     n_unique = len(buckets)
     logger.info(f"Geocoding {n_unique} distinct coordinate(s) for {rows_to_process} row(s).")
@@ -504,13 +559,20 @@ def enrich_with_census(
     When ``use_disk_cache`` is True, geocoder and ACS results are read from and
     appended to JSON files under ``outputs/census_cache/`` so repeat runs for the
     same coordinates or tracts avoid network calls.
+
+    If the frame already has an 11-digit tract GEOID (e.g. ``building.tract_id``),
+    those rows are filled without calling the Census Geocoder. Remaining rows
+    are geocoded from lat/lon as usual.
     """
+    out = df.copy()
+    out, _n_pre = prefill_geocode_columns_from_tract_ids(out)
     out = batch_geocode(
-        df,
+        out,
         lat_col=lat_col,
         lon_col=lon_col,
         max_buildings=max_buildings,
         use_disk_cache=use_disk_cache,
+        skip_rows_with_geoid=True,
     )
 
     need_states: set[str] = set()

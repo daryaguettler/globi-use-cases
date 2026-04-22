@@ -413,17 +413,23 @@ class PropensityModelEngine(BaseModel):
     # ── Building classification ───────────────────────────────────────────────
 
     def _classify_buildings(self) -> None:
-        residential_typologies = {"SFH", "MFH", "Single Family", "Multi Family", "Residential"}
         typology_col = next((c for c in ["feature.semantic.Typology", "Typology", "building.typology", "typology"] if c in self.data.columns), None)
         if typology_col is None:
             logger.warning("No typology column found, defaulting all buildings to residential")
             self.data["building_type"] = "residential"
             return
 
+        # substring checks on lowercased label (handles "Single-family", "Multifamily", etc.)
+        _res_hints = (
+            "sfh", "mfh", "single", "family", "multi", "residential", "duplex",
+            "townhouse", "apartment", "condo", "bungalow", "detached",
+        )
+
         def _classify(t: object) -> Literal["residential", "commercial"]:
             if pd.isna(t):
                 return "residential"
-            return "residential" if any(r in str(t) for r in residential_typologies) else "commercial"
+            s = str(t).lower()
+            return "residential" if any(h in s for h in _res_hints) else "commercial"
 
         self.data["building_type"] = self.data[typology_col].apply(_classify)
         n_res = (self.data["building_type"] == "residential").sum()

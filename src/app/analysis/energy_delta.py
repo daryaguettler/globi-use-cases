@@ -16,8 +16,9 @@ The output ``policy_impacts`` DataFrame is compatible with
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import numpy as np
 import pandas as pd
@@ -97,30 +98,52 @@ DEFAULT_ENERGY_PRICES: dict[str, float] = EnergyPrices().to_dict()
 
 FUEL_LABELS = tuple(DEFAULT_ENERGY_PRICES.keys())
 
+_ROT_RECT_COLS = (
+    "rotated_rectangle",
+    "GLOBI_ROTATED_RECTANGLE",
+    "feature.geometry.rotated_rectangle",
+)
+
 
 # ── Parquet loading ────────────────────────────────────────────────────────────
 
-def load_energy_parquet(source: str | Path | bytes) -> pd.DataFrame:
-    """Load a globi EnergyAndPeak.pq and return a flat DataFrame.
+def rotated_rectangle_column(df: pd.DataFrame) -> str | None:
+    """First matching footprint geometry column, if any."""
+    for c in _ROT_RECT_COLS:
+        if c in df.columns:
+            return c
+    return None
 
-    The MultiIndex is expanded into regular columns with their original dotted
-    names (e.g. ``feature.semantic.Heating``).  MultiIndex columns are joined
-    with ``"."`` (e.g. ``Energy.Heating``).
-    """
+
+def normalize_epsg_code(user: str | None) -> str | None:
+    """Normalize user-entered CRS to ``EPSG:nnnn`` when possible."""
+    if user is None:
+        return None
+    u = user.strip()
+    if not u:
+        return None
+    up = u.upper()
+    if up.startswith("EPSG:"):
+        return up
+    if u.isdigit():
+        return f"EPSG:{u}"
+    return u
+
+
+def flatten_energy_parquet(source: str | Path | bytes) -> pd.DataFrame:
+    """Flatten index/columns only — no ``lat``/``lon`` derivation or CRS rewrite."""
     if isinstance(source, (bytes, bytearray)):
         import io
         df = pd.read_parquet(io.BytesIO(source))
     else:
         df = pd.read_parquet(source)
 
-    # Flatten index
     if isinstance(df.index, pd.MultiIndex):
         meta = df.index.to_frame(index=False)
         meta.columns = [str(c) for c in meta.columns]
     else:
         meta = pd.DataFrame({"_idx": range(len(df))})
 
-    # Flatten columns
     if isinstance(df.columns, pd.MultiIndex):
         flat_cols = [".".join(str(lv) for lv in col).strip(".") for col in df.columns]
     else:
@@ -133,49 +156,218 @@ def load_energy_parquet(source: str | Path | bytes) -> pd.DataFrame:
 
     result = pd.concat([meta, data], axis=1)
     result = result.loc[:, ~result.columns.duplicated()]
-    _extract_lat_lon(result)
     return result
 
 
-def _extract_lat_lon(df: pd.DataFrame) -> None:
-    """Derive ``lat``/``lon`` columns from ``rotated_rectangle`` if not already present.
+def load_energy_parquet(
+    source: str | Path | bytes,
+    *,
+    footprint_crs: str | None = None,
+    rewrite_footprints_wgs84: bool = False,
+) -> pd.DataFrame:
+    """Load a globi EnergyAndPeak.pq and return a flat DataFrame.
 
-    Handles both WKT strings (old format, EPSG:3857) and base64-encoded WKB
-    (P3 format, also EPSG:3857).  Modifies *df* in-place; silently no-ops if
-    neither ``rotated_rectangle`` nor a lat/lon column can be found.
+    The MultiIndex is expanded into regular columns with their original dotted
+    names (e.g. ``feature.semantic.Heating``).  MultiIndex columns are joined
+    with ``"."`` (e.g. ``Energy.Heating``).
+
+    Args:
+        source: Path or parquet bytes.
+        footprint_crs: Optional ``EPSG:…`` for ``rotated_rectangle`` before WGS84
+            (overrides env). Use when footprints are UTM or mis-detected.
+        rewrite_footprints_wgs84: If True, replace footprint column values with
+            WGS84 WKT after projecting from *footprint_crs* / auto-resolved CRS.
     """
+    result = flatten_energy_parquet(source)
+    rect_col = rotated_rectangle_column(result)
+    if rect_col and rewrite_footprints_wgs84:
+        src = resolved_rotated_rectangle_epsg(result, rect_col, user_crs=footprint_crs)
+        reproject_rotated_rectangle_to_wgs84_wkt(result, rect_col, src)
+        _extract_lat_lon(result, footprint_crs=None)
+    else:
+        _extract_lat_lon(result, footprint_crs=footprint_crs)
+    return result
+
+
+def footprint_geometry_summary(df: pd.DataFrame) -> dict[str, Any]:
+    """Describe footprint encoding and bounds for CRS picking in the UI."""
+    col = rotated_rectangle_column(df)
+    if col is None:
+        return {"has_footprint": False}
+    series = df[col].dropna().astype(str)
+    if series.empty:
+        return {"has_footprint": False, "column": col}
+    geom, kind = _parse_footprint_geometry(str(series.iloc[0]))
+    if geom is None:
+        return {
+            "has_footprint": True,
+            "column": col,
+            "encoding": kind or "unknown",
+            "parse_error": True,
+        }
+    minx, miny, maxx, maxy = geom.bounds
+    env_globi = bool(os.environ.get("GLOBI_ROTATED_RECTANGLE_CRS", "").strip())
+    env_zone = bool(os.environ.get("GLOBI_UTM_ZONE_N", "").strip())
+    structural = _structural_footprint_crs_hint(geom, kind)
+    auto_epsg = resolved_rotated_rectangle_epsg(df, col, user_crs=None)
+    return {
+        "has_footprint": True,
+        "column": col,
+        "encoding": kind,
+        "bounds": (minx, miny, maxx, maxy),
+        "structural_hint": structural,
+        "auto_resolved_epsg": auto_epsg,
+        "env_globi_crs_set": env_globi,
+        "env_utm_zone_set": env_zone,
+    }
+
+
+def _structural_footprint_crs_hint(geom, kind: str) -> str:
+    if kind == "wkb":
+        return "binary WKB — convention in this repo is EPSG:3857 (Web Mercator)"
+    minx, miny, maxx, maxy = geom.bounds
+    max_abs = max(abs(minx), abs(miny), abs(maxx), abs(maxy))
+    if max_abs <= 180.0 and minx >= -180.0 and maxx <= 180.0 and miny >= -90.0 and maxy <= 90.0:
+        span_x = maxx - minx
+        span_y = maxy - miny
+        if span_x <= 5.0 and span_y <= 5.0:
+            return "WKT axis ranges look like degrees — EPSG:4326"
+    if max(abs(minx), abs(maxx)) > 2_000_000 or max(abs(miny), abs(maxy)) > 2_000_000:
+        return "large coordinates — likely EPSG:3857 (Web Mercator) for WKT"
+    if (
+        50_000 <= minx <= 900_000
+        and 50_000 <= maxx <= 900_000
+        and 1_000_000 <= miny <= 10_000_000
+        and 1_000_000 <= maxy <= 10_000_000
+    ):
+        return (
+            "easting/northing look like northern UTM metres — choose EPSG:32601–32660 "
+            "(e.g. Arizona often EPSG:32612)"
+        )
+    return "could not classify — set CRS explicitly"
+
+
+def reproject_rotated_rectangle_to_wgs84_wkt(
+    df: pd.DataFrame,
+    rect_col: str,
+    source_epsg: str,
+) -> None:
+    """Replace *rect_col* polygons with WGS84 WKT, projected from *source_epsg*."""
+    import geopandas as gpd
+    from shapely import wkt as shapely_wkt
+
+    series = df[rect_col].dropna().astype(str)
+    idxs: list[Any] = []
+    geoms: list[Any] = []
+    for i, raw in series.items():
+        g, _k = _parse_footprint_geometry(str(raw))
+        if g is None:
+            continue
+        idxs.append(i)
+        geoms.append(g)
+    if not geoms:
+        return
+    gs = gpd.GeoSeries(geoms, crs=source_epsg).to_crs("EPSG:4326")
+    wkts = gs.map(lambda x: shapely_wkt.dumps(x, rounding_precision=9))
+    df.loc[idxs, rect_col] = wkts.values
+
+
+def _parse_footprint_geometry(s: str):
+    import base64
+    from shapely import wkb as shapely_wkb
+    from shapely import wkt as shapely_wkt
+
+    try:
+        return shapely_wkt.loads(s), "wkt"
+    except Exception:
+        pass
+    try:
+        return shapely_wkb.loads(base64.b64decode(s)), "wkb"
+    except Exception:
+        return None, None
+
+
+def resolved_rotated_rectangle_epsg(
+    df: pd.DataFrame,
+    rect_col: str,
+    *,
+    user_crs: str | None = None,
+) -> str:
+    """EPSG for coordinates in *rect_col* before reprojection to WGS84.
+
+    Priority: *user_crs* (app / API), ``GLOBI_ROTATED_RECTANGLE_CRS``,
+    ``GLOBI_UTM_ZONE_N`` (with UTM-like WKT), then structural heuristics
+    (3857 for WKB and Web-Mercator-scale WKT, 4326 for degree-like WKT).
+    """
+    nu = normalize_epsg_code(user_crs)
+    if nu:
+        return nu
+
+    env_crs = os.environ.get("GLOBI_ROTATED_RECTANGLE_CRS", "").strip()
+    if env_crs:
+        return normalize_epsg_code(env_crs) or env_crs
+
+    series = df[rect_col].dropna().astype(str)
+    if series.empty:
+        return "EPSG:3857"
+
+    geom, kind = _parse_footprint_geometry(str(series.iloc[0]))
+    if geom is None:
+        return "EPSG:3857"
+
+    if kind == "wkb":
+        return "EPSG:3857"
+
+    minx, miny, maxx, maxy = geom.bounds
+    max_abs = max(abs(minx), abs(miny), abs(maxx), abs(maxy))
+    if max_abs <= 180.0 and minx >= -180.0 and maxx <= 180.0 and miny >= -90.0 and maxy <= 90.0:
+        span_x = maxx - minx
+        span_y = maxy - miny
+        if span_x <= 5.0 and span_y <= 5.0:
+            return "EPSG:4326"
+
+    if max(abs(minx), abs(maxx)) > 2_000_000 or max(abs(miny), abs(maxy)) > 2_000_000:
+        return "EPSG:3857"
+
+    if (
+        50_000 <= minx <= 900_000
+        and 50_000 <= maxx <= 900_000
+        and 1_000_000 <= miny <= 10_000_000
+        and 1_000_000 <= maxy <= 10_000_000
+    ):
+        z_env = os.environ.get("GLOBI_UTM_ZONE_N", "").strip()
+        if z_env.isdigit():
+            z = int(z_env)
+            if 1 <= z <= 60:
+                return f"EPSG:{32600 + z}"
+        logger.warning(
+            "rotated_rectangle looks like UTM metres but no zone — using EPSG:3857 "
+            "(wrong). Set footprint CRS in the app, GLOBI_UTM_ZONE_N, or "
+            "GLOBI_ROTATED_RECTANGLE_CRS."
+        )
+
+    return "EPSG:3857"
+
+
+def _extract_lat_lon(df: pd.DataFrame, footprint_crs: str | None = None) -> None:
+    """Derive ``lat``/``lon`` from ``rotated_rectangle`` if not already present."""
     if "lat" in df.columns and "lon" in df.columns:
         return
 
-    rect_col = next(
-        (c for c in ["rotated_rectangle", "GLOBI_ROTATED_RECTANGLE"] if c in df.columns),
-        None,
-    )
+    rect_col = rotated_rectangle_column(df)
     if rect_col is None:
         return
 
     try:
-        import base64
         import geopandas as gpd
-        from shapely import wkb as shapely_wkb
-        from shapely import wkt as shapely_wkt
-
-        def _parse_geom(s: str):
-            try:
-                return shapely_wkt.loads(s)
-            except Exception:
-                pass
-            try:
-                return shapely_wkb.loads(base64.b64decode(s))
-            except Exception:
-                return None
 
         series = df[rect_col].dropna().astype(str)
-        geoms = series.map(_parse_geom)
+        geoms = series.map(lambda s: _parse_footprint_geometry(s)[0])
         valid = geoms.dropna()
         if valid.empty:
             return
-        gs = gpd.GeoSeries(valid, crs="EPSG:3857").to_crs("EPSG:4326")
+        epsg = resolved_rotated_rectangle_epsg(df, rect_col, user_crs=footprint_crs)
+        gs = gpd.GeoSeries(valid, crs=epsg).to_crs("EPSG:4326")
         centroids = gs.centroid
         df.loc[valid.index, "lon"] = centroids.x.values
         df.loc[valid.index, "lat"] = centroids.y.values
@@ -426,7 +618,7 @@ _METADATA_MAP: dict[str, str] = {
     "feature.semantic.Age_bracket": "feature.semantic.Age_bracket",
     "feature.semantic.Income": "feature.semantic.Income",
     "feature.geometry.energy_model_conditioned_area": "area_m2",
-    # New-schema geometry: rotated rectangle WKT (EPSG:3857) used for geocoding
+    # footprint geometry; crs resolved in ``resolved_rotated_rectangle_epsg``
     "rotated_rectangle": "rotated_rectangle",
     "GLOBI_ROTATED_RECTANGLE": "rotated_rectangle",
     # Legacy-schema location fields and derived centroid columns
