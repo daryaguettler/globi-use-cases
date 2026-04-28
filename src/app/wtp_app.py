@@ -1353,10 +1353,6 @@ def _render_config_tab() -> None:
     st.divider()
 
     st.markdown("### Energy Prices")
-    st.caption(
-        "Bundled defaults (``DEFAULT_ENERGY_PRICES`` in ``energy_delta``) are used to convert kWh to annual $ in the main run "
-        "(policy impacts and WTP propensity). Values below are kept for presets and saved configs; they do not override that path."
-    )
     prices: dict[str, float] = st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES))
     price_cols = st.columns(4)
     new_prices: dict[str, float] = {}
