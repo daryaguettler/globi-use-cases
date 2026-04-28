@@ -97,6 +97,9 @@ _SCENARIOS_DIR.mkdir(parents=True, exist_ok=True)
 _YEARS_RANGE = list(range(2024, 2101))
 _PROJECTION_YEARS = list(range(2025, 2101))
 
+# wip explorer (tab 6): perceived annual energy savings term in logit (_WIP_COEFFICIENTS["Energy cost"])
+_WIP_INCLUDE_ENERGY_COST_COEFFICIENT = False
+
 # Income tiers for incentive UI — maps display label → list of INCOME_CATEGORIES_K values
 # that fall in that tier (midpoints in k$, matching apply_propensity.INCOME_CATEGORIES)
 _INCOME_TIERS: list[tuple[str, list[float]]] = [
@@ -1350,7 +1353,10 @@ def _render_config_tab() -> None:
     st.divider()
 
     st.markdown("### Energy Prices")
-    st.caption("Used to convert kWh to annual energy cost (USD) for the WTP model.")
+    st.caption(
+        "Bundled defaults (``DEFAULT_ENERGY_PRICES`` in ``energy_delta``) are used to convert kWh to annual $ in the main run "
+        "(policy impacts and WTP propensity). Values below are kept for presets and saved configs; they do not override that path."
+    )
     prices: dict[str, float] = st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES))
     price_cols = st.columns(4)
     new_prices: dict[str, float] = {}
@@ -2172,7 +2178,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 scenario_df=scen_flat,
                 scenario_name=st.session_state["scenario_name"],
                 cost_per_sqm=float(st.session_state.get("cost_per_sqm", 150.0)),
-                energy_prices=st.session_state.get("energy_prices"),
+                energy_prices=dict(DEFAULT_ENERGY_PRICES),
             )
             kwh_cols = [c for c in pi.columns if "_kwh_" in c]
             year_energy_data[yr] = pi.set_index("building.id")[kwh_cols]
@@ -3704,11 +3710,14 @@ def _wip_run_simulation(tract_data, building_age, upfront_cost_range, energy_cos
         hh = random.choices(hh_cats, weights=hh_counts, k=1)[0] if float(np.sum(hh_counts)) > 0 else 2
         inc = random.choices(inc_cats, weights=inc_counts, k=1)[0] if float(np.sum(inc_counts)) > 0 else 55
         cost = random.uniform(*upfront_cost_range)
-        energy = random.uniform(*energy_cost_range)
+        energy_term = 0.0
+        if _WIP_INCLUDE_ENERGY_COST_COEFFICIENT:
+            energy = random.uniform(*energy_cost_range)
+            energy_term = C["Energy cost"] * energy
         Z = (C["intercept"] + C["Year built"] * building_age + C["Education"] * edu
              + C["bedrooms"] * hh + C["residents"] * hh + C["Income"] * inc
              + C["Concern"] * concern + C["Upfront cost"] * cost
-             + C["Neighbor"] * neighbor + C["Energy cost"] * energy)
+             + C["Neighbor"] * neighbor + energy_term)
         probs.append(1 / (1 + np.exp(-Z)))
     return np.array(probs)
 
@@ -3951,12 +3960,15 @@ def _render_wip_explorer_tab() -> None:
                 value=(10, 40),
                 key="wip_cost",
             )
-            energy_min, energy_max = st.select_slider(
-                "Perceived annual energy savings range (hundreds $)",
-                options=[round(x, 1) for x in np.arange(0, 11, 0.5)],
-                value=(0.0, 10.0),
-                key="wip_energy",
-            )
+            if _WIP_INCLUDE_ENERGY_COST_COEFFICIENT:
+                energy_min, energy_max = st.select_slider(
+                    "Perceived annual energy savings range (hundreds $)",
+                    options=[round(x, 1) for x in np.arange(0, 11, 0.5)],
+                    value=(0.0, 10.0),
+                    key="wip_energy",
+                )
+            else:
+                energy_min, energy_max = (0.0, 10.0)
         with p_col2:
             st.markdown("**Behavioural** _(not in census data)_")
             concern_level = st.slider("Environmental concern (1=Low, 5=High)", 1, 5, 3, key="wip_concern")
@@ -4070,11 +4082,16 @@ def _render_wip_explorer_tab() -> None:
         )
         st.session_state["wip_tract_results"] = tract_results
         st.session_state["wip_tract_state"] = selected_state
-        st.session_state["wip_sim_params"] = {
-            "building_age": building_age, "cost_range": (cost_min, cost_max),
-            "energy_range": (energy_min, energy_max),
-            "concern_level": concern_level, "neighbor_effect": neighbor_effect,
+        params: dict = {
+            "building_age": building_age,
+            "cost_range": (cost_min, cost_max),
+            "concern_level": concern_level,
+            "neighbor_effect": neighbor_effect,
+            "energy_cost_coefficient_enabled": _WIP_INCLUDE_ENERGY_COST_COEFFICIENT,
         }
+        if _WIP_INCLUDE_ENERGY_COST_COEFFICIENT:
+            params["energy_range"] = (energy_min, energy_max)
+        st.session_state["wip_sim_params"] = params
 
         all_p = list(tract_results.values())
         min_p, max_p = min(all_p), max(all_p)
