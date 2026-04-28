@@ -605,6 +605,11 @@ def enrich_with_census(
         use_disk_cache=use_disk_cache,
         skip_rows_with_geoid=True,
     )
+    # match bundled parquet keys (float64 geoids / "....0" strings miss dict lookup → ACS API)
+    if "geoid" in out.columns:
+        out["geoid"] = out["geoid"].map(
+            lambda v: (canonical_census_geoid_str(v) or None) if pd.notna(v) else v
+        )
 
     need_states: set[str] = set()
     for v in out["state_fips"].dropna().unique():
@@ -627,7 +632,11 @@ def enrich_with_census(
         if not all([state, county, tract]):
             continue
         key_str = _tract_cache_key(str(state), str(county), str(tract))
-        gid = str(out.at[idx, "geoid"]).strip() if pd.notna(out.at[idx, "geoid"]) else ""
+        gid = (
+            canonical_census_geoid_str(out.at[idx, "geoid"])
+            if pd.notna(out.at[idx, "geoid"])
+            else ""
+        )
         state_st = str(state).strip().zfill(2)
 
         if key_str not in tract_cache:
