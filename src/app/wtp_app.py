@@ -418,6 +418,8 @@ _STATE_DEFAULTS: dict = {
     "footprint_crs_choice": "auto",
     "footprint_crs_custom": "",
     "rewrite_footprints_wgs84": False,
+    # sqm or sqft — unit of conditioned floor area column in EnergyAndPeak parquet
+    "building_area_unit": "sqm",
 }
 for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
@@ -489,6 +491,7 @@ def _save_config(name: str) -> None:
         "emissions_trajectories": _load_emissions_json(),
         "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
         "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "building_area_unit": str(st.session_state.get("building_area_unit", "sqm")),
         "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
         "incentive_config": incentive_cfg.model_dump(),
     }
@@ -516,6 +519,11 @@ def _load_config(name: str) -> bool:
         st.session_state["energy_prices"] = config["energy_prices"]
     if "cost_per_sqm" in config:
         st.session_state["cost_per_sqm"] = float(config["cost_per_sqm"])
+    if "building_area_unit" in config:
+        u = str(config["building_area_unit"]).lower()
+        st.session_state["building_area_unit"] = u if u in ("sqm", "sqft") else "sqm"
+        if "upload_building_area_unit" in st.session_state:
+            st.session_state["upload_building_area_unit"] = st.session_state["building_area_unit"]
     if "incentives_enabled" in config:
         st.session_state["incentives_enabled"] = bool(config["incentives_enabled"])
     if "incentive_config" in config:
@@ -542,6 +550,7 @@ def _save_input_preset(name: str) -> tuple[bool, str]:
         list(st.session_state.get("selected_years", [2025])),
         str(st.session_state.get("scenario_name", "Retrofit")),
         st.session_state.get("year_files", {}),
+        building_area_unit=str(st.session_state.get("building_area_unit", "sqm")),
     )
     _INPUT_PRESETS_DIR.mkdir(parents=True, exist_ok=True)
     (_INPUT_PRESETS_DIR / f"{clean}.json").write_text(preset_json_dumps(payload))
@@ -569,6 +578,9 @@ def _apply_input_preset(name: str) -> tuple[bool, str]:
     st.session_state["selected_years"] = list(result.selected_years)
     st.session_state["scenario_name"] = result.scenario_name
     st.session_state["upload_scenario_name"] = result.scenario_name
+    st.session_state["building_area_unit"] = getattr(result, "building_area_unit", "sqm")
+    if "upload_building_area_unit" in st.session_state:
+        st.session_state["upload_building_area_unit"] = st.session_state["building_area_unit"]
     for i, y in enumerate(result.selected_years):
         st.session_state[f"upload_yr_{i}"] = int(y)
     st.session_state["upload_mode"] = result.upload_mode
@@ -693,6 +705,7 @@ def _save_scenario_results(name: str) -> None:
         "emissions_trajectories": _load_emissions_json(),
         "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
         "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "building_area_unit": str(st.session_state.get("building_area_unit", "sqm")),
         "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
         "incentive_config": incentive_cfg.model_dump(),
     }
@@ -876,7 +889,7 @@ def _preview_parquet(file_bytes: bytes) -> dict:
             None,
         )
         scenarios = sorted(idx[scenario_col].dropna().unique().tolist()) if scenario_col else []
-        return {"n_buildings": n_buildings, "total_area_m2": total_area, "scenarios": scenarios}
+        return {"n_buildings": n_buildings, "total_conditioned_area": total_area, "scenarios": scenarios}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -893,6 +906,25 @@ def _render_upload_tab() -> None:
         "timeseries at that point. The earliest year is used as the reference for per-building "
         "WTP scoring; adoption and emissions are projected forward analytically."
     )
+
+    st.markdown("**Conditioned floor area in parquet files**")
+    unit_opts = ("sqm", "sqft")
+    cur = st.session_state.get("building_area_unit", "sqm")
+    idx = unit_opts.index(cur) if cur in unit_opts else 0
+    area_unit = st.radio(
+        "Area unit (GIS / energy_model_conditioned_area column)",
+        unit_opts,
+        index=idx,
+        horizontal=True,
+        format_func=lambda u: "Square metres (m²)" if u == "sqm" else "Square feet (ft²)",
+        key="upload_building_area_unit",
+        help=(
+            "Must match how conditioned floor area is stored in your inputs. "
+            "Energy intensities in globi output are per m² — when you choose ft², areas are converted "
+            "to m² for kWh math. Retrofit cost in **Configure** uses this same unit ($/m² or $/ft²)."
+        ),
+    )
+    st.session_state["building_area_unit"] = area_unit
 
     if st.session_state.get("_example_preloaded"):
         st.info(
@@ -1275,12 +1307,14 @@ def _render_upload_tab() -> None:
 
 def _show_file_kpis(info: dict) -> None:
     k1, k2, k3 = st.columns(3)
-    area = info.get("total_area_m2")
+    area = info.get("total_conditioned_area") or info.get("total_area_m2")
+    unit = st.session_state.get("building_area_unit", "sqm")
+    area_suffix = "m²" if unit == "sqm" else "ft²"
     scens = info.get("scenarios", [])
     with k1:
         st.metric("Buildings", info.get("n_buildings", "—"))
     with k2:
-        st.metric("Total area", f"{area:,.0f} m²" if area else "—")
+        st.metric("Total conditioned area", f"{area:,.0f} {area_suffix}" if area else "—")
     with k3:
         st.metric("Scenario(s) in file", ", ".join(scens) if scens else "—")
 
@@ -1294,21 +1328,31 @@ def _render_config_tab() -> None:
 
     # ── Retrofit cost ──────────────────────────────────────────────────────────
     st.markdown("### Retrofit Cost")
+    area_unit = st.session_state.get("building_area_unit", "sqm")
+    cost_label = (
+        "Retrofit cost ($/m² conditioned area)"
+        if area_unit == "sqm"
+        else "Retrofit cost ($/ft² conditioned area)"
+    )
+    cost_help = (
+        "Gross capital cost before any incentives. Unit matches **Conditioned floor area** "
+        "chosen in Step 1 (m² or ft²)."
+    )
     cost_col1, cost_col2 = st.columns(2)
     with cost_col1:
         cost_per_sqm = st.number_input(
-            "Retrofit cost ($/m² conditioned area)",
+            cost_label,
             min_value=0.0, value=float(st.session_state.get("cost_per_sqm", 150.0)),
             step=5.0, format="%.2f",
             key="cfg_cost_sqm",
-            help="Gross capital cost before any incentives.",
+            help=cost_help,
         )
         st.session_state["cost_per_sqm"] = cost_per_sqm
     with cost_col2:
         st.markdown("")
         st.info(
             "Cost is applied uniformly across all buildings. To model variable "
-            "costs, update the cost/m² and re-run for different scenarios."
+            "costs, update the amount per unit area and re-run for different scenarios."
         )
 
     st.divider()
@@ -2175,6 +2219,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 scenario_name=st.session_state["scenario_name"],
                 cost_per_sqm=float(st.session_state.get("cost_per_sqm", 150.0)),
                 energy_prices=dict(DEFAULT_ENERGY_PRICES),
+                conditioned_area_unit=str(st.session_state.get("building_area_unit", "sqm")),
             )
             kwh_cols = [c for c in pi.columns if "_kwh_" in c]
             year_energy_data[yr] = pi.set_index("building.id")[kwh_cols]
@@ -4199,7 +4244,6 @@ def _render_wip_explorer_tab() -> None:
                                 disabled=(integration_method != "mc_ensemble"), key="wip_ens")
         wip_dice_never = st.checkbox(
             "M2/M4: no re-entry after failed year",
-            value=bool(st.session_state.get("wip_dice_reentry_never", True)),
             key="wip_dice_reentry_never",
             disabled=(integration_method not in ("dice_roll", "mc_ensemble")),
         )

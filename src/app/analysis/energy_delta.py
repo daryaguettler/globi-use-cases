@@ -98,6 +98,9 @@ DEFAULT_ENERGY_PRICES: dict[str, float] = EnergyPrices().to_dict()
 
 FUEL_LABELS = tuple(DEFAULT_ENERGY_PRICES.keys())
 
+# international foot: 1 sq ft -> m² (area conversions for conditioned floor area column)
+SQFT_TO_SQM = 0.09290304
+
 _ROT_RECT_COLS = (
     "rotated_rectangle",
     "GLOBI_ROTATED_RECTANGLE",
@@ -393,6 +396,23 @@ def _get_area(df: pd.DataFrame) -> pd.Series:
     return pd.Series(np.zeros(len(df)), index=df.index)
 
 
+def conditioned_area_raw_to_sqm(raw: pd.Series, unit: str) -> pd.Series:
+    """Treat ``raw`` conditioned-area values as m² or ft² and return m² for energy/cost math."""
+    u = (unit or "sqm").strip().lower()
+    num = pd.to_numeric(raw, errors="coerce").fillna(0.0)
+    if u == "sqft":
+        return num * SQFT_TO_SQM
+    return num
+
+
+def retrofit_cost_per_unit_to_per_sqm(cost: float, unit: str) -> float:
+    """Convert user retrofit cost (per m² or per ft²) to USD/m²."""
+    u = (unit or "sqm").strip().lower()
+    if u == "sqft":
+        return float(cost) / SQFT_TO_SQM
+    return float(cost)
+
+
 def _get_building_id(df: pd.DataFrame) -> pd.Series:
     s = _col(df, "building.id", "building_id", "feature.id", "id")
     if s is not None:
@@ -410,7 +430,7 @@ def _has_utilities_schema(df: pd.DataFrame) -> bool:
     )
 
 
-def compute_fuel_kwh(df: pd.DataFrame) -> pd.DataFrame:
+def compute_fuel_kwh(df: pd.DataFrame, *, conditioned_area_unit: str = "sqm") -> pd.DataFrame:
     """Compute per-building annual kWh by fuel type.
 
     Supports two parquet schemas:
@@ -425,8 +445,12 @@ def compute_fuel_kwh(df: pd.DataFrame) -> pd.DataFrame:
 
     Returns a DataFrame with columns:
         ``kwh_Electricity``, ``kwh_Natural Gas``, ``kwh_Fuel Oil``, ``kwh_Propane``
+
+    Args:
+        conditioned_area_unit: ``sqm`` or ``sqft`` — how the parquet conditioned-area column is stored.
+            Intensities are assumed per m²; values in ft² are converted to m² before scaling.
     """
-    area = _get_area(df)
+    area = conditioned_area_raw_to_sqm(_get_area(df), conditioned_area_unit)
 
     # ── New schema: Energy.Utilities.{fuel}.{month} ────────────────────────────
     if _has_utilities_schema(df):
@@ -554,6 +578,8 @@ def build_policy_impacts(
     scenario_name: str,
     cost_per_sqm: float,
     energy_prices: EnergyPrices | dict[str, float] | None = None,
+    *,
+    conditioned_area_unit: str = "sqm",
 ) -> pd.DataFrame:
     """Produce a ``policy_impacts`` DataFrame compatible with PropensityModelEngine.
 
@@ -561,8 +587,10 @@ def build_policy_impacts(
         baseline_df:   Flat DataFrame from ``load_energy_parquet`` for baseline.
         scenario_df:   Flat DataFrame from ``load_energy_parquet`` for the scenario.
         scenario_name: User-provided label for the retrofit scenario.
-        cost_per_sqm:  Gross retrofit cost per m² of conditioned floor area.
+        cost_per_sqm:  Gross retrofit cost per unit of conditioned floor area: USD/m² if
+            ``conditioned_area_unit`` is ``sqm``, USD/ft² if ``sqft``.
         energy_prices: Optional per-fuel USD/kWh overrides as ``EnergyPrices`` or dict.
+        conditioned_area_unit: ``sqm`` or ``sqft`` — unit of the conditioned-area column in the files.
 
     Returns:
         Flat DataFrame (one row per building) ready for PropensityModelEngine.
@@ -578,15 +606,16 @@ def build_policy_impacts(
     n = len(base_aligned)
     logger.info(f"Matched {n} buildings for scenario '{scenario_name}'.")
 
-    base_kwh = compute_fuel_kwh(base_aligned)
-    scen_kwh = compute_fuel_kwh(scen_aligned)
+    base_kwh = compute_fuel_kwh(base_aligned, conditioned_area_unit=conditioned_area_unit)
+    scen_kwh = compute_fuel_kwh(scen_aligned, conditioned_area_unit=conditioned_area_unit)
 
     base_cost = compute_annual_energy_cost(base_kwh, prices)
     scen_cost = compute_annual_energy_cost(scen_kwh, prices)
     energy_savings = (base_cost - scen_cost).clip(lower=0.0)
 
-    area = _get_area(base_aligned)
-    retrofit_cost = area * cost_per_sqm
+    area_sqm = conditioned_area_raw_to_sqm(_get_area(base_aligned), conditioned_area_unit)
+    cost_per_sqm_internal = retrofit_cost_per_unit_to_per_sqm(cost_per_sqm, conditioned_area_unit)
+    retrofit_cost = area_sqm * cost_per_sqm_internal
 
     out = pd.DataFrame(index=base_aligned.index)
     out["building.id"] = base_aligned.index.astype(str)

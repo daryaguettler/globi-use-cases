@@ -25,6 +25,7 @@ class ApplyResult:
     selected_years: list[int] = field(default_factory=list)
     scenario_name: str = "Retrofit"
     upload_mode: str = MODE_BROWSE
+    building_area_unit: str = "sqm"
 
 
 def _norm_rel(s: str) -> str:
@@ -37,6 +38,7 @@ def build_input_preset_dict(
     selected_years: list[int],
     scenario_name: str,
     year_files: dict[int, Any],
+    building_area_unit: str = "sqm",
 ) -> dict[str, Any]:
     assignments: dict[str, dict[str, str]] = {}
     for yr in selected_years:
@@ -67,6 +69,9 @@ def build_input_preset_dict(
         "n_years": int(n_years),
         "selected_years": [int(y) for y in selected_years],
         "scenario_name": (scenario_name or "Retrofit").strip() or "Retrofit",
+        "building_area_unit": str(building_area_unit or "sqm").lower()
+        if str(building_area_unit or "sqm").lower() in ("sqm", "sqft")
+        else "sqm",
         "assignments": assignments,
     }
 
@@ -91,6 +96,8 @@ def apply_input_preset(
         raw_years = preset.get("selected_years") or [2025]
         selected_years = [int(y) for y in raw_years]
         scenario_name = str(preset.get("scenario_name") or "Retrofit").strip() or "Retrofit"
+        raw_bau = str(preset.get("building_area_unit") or "sqm").lower()
+        building_area_unit = raw_bau if raw_bau in ("sqm", "sqft") else "sqm"
         assignments: dict[str, Any] = preset.get("assignments") or {}
     except (TypeError, ValueError) as exc:
         return ApplyResult(ok=False, error=f"invalid preset: {exc}")
@@ -173,6 +180,7 @@ def apply_input_preset(
         selected_years=selected_years,
         scenario_name=scenario_name,
         upload_mode=upload_mode,
+        building_area_unit=building_area_unit,
     )
 
 
