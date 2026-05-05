@@ -53,8 +53,10 @@ from app.analysis.energy_delta import (
     footprint_geometry_summary,
     load_energy_parquet,
     normalize_epsg_code,
+    policy_df_has_kwh_breakdown,
     resolved_rotated_rectangle_epsg,
     rotated_rectangle_column,
+    scatter_energy_savings_x_values,
 )
 from app.analysis.adoption_breakdown import (
     build_adoption_finance_breakdown_dataframe,
@@ -214,7 +216,11 @@ Histogram of **acceptance probability** \(p_i\) across buildings (same \(p_i\) a
 _FORMULA_MD_ENERGY_SAVINGS_SCATTER = r"""
 ### Energy savings vs propensity
 
-Each point is one building: **x** = annual energy cost savings (\$/yr), **y** = acceptance probability \(p_i\). Shows how financial savings relate to modelled willingness to accept.
+Each point is one building: **y** = acceptance probability \(p_i\).
+
+**X-axis — $\$/yr$ (default):** annual energy **bill** savings from the policy impacts table (`energy_cost.annual_savings`).
+
+**X-axis — kBTU/ft²·yr (toggle):** annual **site** energy savings = \(\sum_f (\mathrm{kWh}_{\mathrm{baseline},f} - \mathrm{kWh}_{\mathrm{scenario},f})\), clipped at zero, times **3.412142 kBTU/kWh**, divided by conditioned floor area in **ft²**. Area matches **Step 1 — Conditioned floor area** (values are raw parquet numbers in the `area_m2` column of policy impacts).
 """
 
 _FORMULA_MD_PORTFOLIO_RETROFIT_AND_INCENTIVE = r"""
@@ -1726,6 +1732,34 @@ def _ensure_reserved_scenarios(raw: dict) -> tuple[dict, bool]:
     return raw, changed
 
 
+def _ac_interp_value(values: dict | None, year: int, fallback: float = 0.0) -> float:
+    """Return scenario value for a year with linear interpolation/extrapolation."""
+    if not values:
+        return float(fallback)
+
+    year_s = str(int(year))
+    if year_s in values:
+        return float(values[year_s])
+
+    years = sorted(int(y) for y in values if str(y).lstrip("-").isdigit())
+    if not years:
+        return float(fallback)
+    if year <= years[0]:
+        return float(values[str(years[0])])
+    if year >= years[-1]:
+        return float(values[str(years[-1])])
+
+    for i, y0 in enumerate(years[:-1]):
+        y1 = years[i + 1]
+        if y0 <= year < y1:
+            t = (year - y0) / (y1 - y0)
+            v0 = float(values[str(y0)])
+            v1 = float(values[str(y1)])
+            return float(v0 + t * (v1 - v0))
+
+    return float(fallback)
+
+
 def _ac_compute_curve(
     shape: str,
     start: float,
@@ -1765,6 +1799,8 @@ def _ac_scenario_editor(
     """
     shape_opts = ["Linear", "Sigmoid", "Exponential"]
     saved_shape = defaults.get("curve_type", "linear").capitalize()
+    start_year = int(curve_years[0])
+    end_year = int(curve_years[-1])
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -1781,21 +1817,22 @@ def _ac_scenario_editor(
             ),
         )
     with col2:
+        start_default = _ac_interp_value(defaults.get("values", {}), start_year, fallback=0.0)
         start_val = st.number_input(
-            "Start adoption (2024)", min_value=0.0, max_value=1.0,
-            value=float(defaults.get("values", {}).get("2024", 0.0)),
+            f"Start adoption ({start_year})", min_value=0.0, max_value=1.0,
+            value=float(start_default),
             step=0.01, format="%.2f", key=f"{prefix}_start",
             help="Fraction of buildings adopted at the beginning of the projection (0 = none, 1 = all).",
         )
     with col3:
-        saved_end = float(
-            defaults.get("values", {}).get("2100")
-            or defaults.get("values", {}).get("2050")
-            or defaults.get("max_adoption", 0.85)
+        saved_end = _ac_interp_value(
+            defaults.get("values", {}),
+            end_year,
+            fallback=float(defaults.get("max_adoption", 0.85)),
         )
         end_val = st.number_input(
-            "End adoption (2100)", min_value=0.0, max_value=1.0,
-            value=saved_end,
+            f"End adoption ({end_year})", min_value=0.0, max_value=1.0,
+            value=float(saved_end),
             step=0.01, format="%.2f", key=f"{prefix}_end",
             help="Target fraction adopted by the end of the projection horizon.",
         )
@@ -1910,6 +1947,12 @@ def _render_adoption_tab() -> None:
         "**No adoption** and **Full adoption** are always included as reference bounds. "
         "Add your own scenarios below."
     )
+    _ac_render_projection_period()
+    start_yr = int(st.session_state.get("proj_start_year", 2025))
+    end_yr = int(st.session_state.get("proj_end_year", 2050))
+    if end_yr <= start_yr:
+        st.warning("Set a valid projection period to edit adoption curves.")
+        return
 
     raw = _load_adoption_curves()
     # Ensure reserved scenarios are present; save if they were missing
@@ -1918,7 +1961,7 @@ def _render_adoption_tab() -> None:
         _save_adoption_curves(raw)
 
     scenarios: dict = raw.get("scenarios", {})
-    curve_years = list(range(2024, 2101))
+    curve_years = list(range(start_yr, end_yr + 1))
     colors = _curve_colors()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -1983,7 +2026,7 @@ def _render_adoption_tab() -> None:
         for i, (name, s) in enumerate(scenarios.items()):
             if name == selected:
                 continue
-            saved_ys = [float(s.get("values", {}).get(str(y), 0.0)) for y in curve_years]
+            saved_ys = [_ac_interp_value(s.get("values", {}), y, fallback=0.0) for y in curve_years]
             is_locked = s.get("locked", False)
             fig.add_trace(go.Scatter(
                 x=curve_years, y=[v * 100 for v in saved_ys],
@@ -1995,7 +2038,7 @@ def _render_adoption_tab() -> None:
                 ),
                 opacity=0.35 if is_locked else 0.55,
             ))
-        preview_ys = [float(v) for v in updated["values"].values()]
+        preview_ys = [float(updated["values"].get(str(y), 0.0)) for y in curve_years]
         fig.add_trace(go.Scatter(
             x=curve_years, y=[v * 100 for v in preview_ys],
             name=f"{selected} (preview)",
@@ -2045,7 +2088,7 @@ def _render_adoption_tab() -> None:
         new_scen = _ac_build_scenario_dict(new_params, curve_years)
 
         # Mini preview inside the expander
-        new_ys = [float(v) for v in new_scen["values"].values()]
+        new_ys = [float(new_scen["values"].get(str(y), 0.0)) for y in curve_years]
         fig_new = go.Figure(go.Scatter(
             x=curve_years, y=[v * 100 for v in new_ys],
             name="Preview", line=dict(color="#16a34a", width=2.5),
@@ -2069,10 +2112,6 @@ def _render_adoption_tab() -> None:
                 st.session_state["adoption_scenario"] = n
                 st.success(f"Created '{n}'.")
                 st.rerun()
-
-    st.divider()
-    _ac_render_projection_period()
-
 
 def _ac_render_projection_period() -> None:
     st.markdown("### Projection Period")
@@ -2256,12 +2295,25 @@ def _run_pipeline(simulated_years: list[int]) -> None:
     census_path = None
     try:
         if st.session_state.get("census_csv_bytes"):
-            import tempfile, os
+            import tempfile
             suf = st.session_state.get("census_upload_suffix", ".csv")
             tmp = tempfile.NamedTemporaryFile(suffix=suf, delete=False)
             tmp.write(st.session_state["census_csv_bytes"])
             tmp.close()
             census_path = tmp.name
+
+        lookup_td: dict = {}
+        lookup_geoid = ""
+        if st.session_state.get("is_us", True) and st.session_state.get("census_csv_bytes") is None:
+            lookup_td, lookup_geoid = _lookup_tract_distribution_from_session()
+            if lookup_geoid:
+                if "geoid" not in policy_impacts.columns:
+                    policy_impacts["geoid"] = lookup_geoid
+                else:
+                    geoid_s = policy_impacts["geoid"].astype(object)
+                    geoid_missing = geoid_s.isna() | geoid_s.astype(str).str.strip().eq("")
+                    policy_impacts.loc[geoid_missing, "geoid"] = lookup_geoid
+                st.session_state["policy_impacts"] = policy_impacts
 
         propensity_engine = PropensityModelEngine(
             policy_impacts_df=policy_impacts,
@@ -2277,6 +2329,8 @@ def _run_pipeline(simulated_years: list[int]) -> None:
             td = tract_distributions_from_enriched(policy_impacts, propensity_engine.county_fips_map)
             if td:
                 propensity_engine.tract_distributions.update(td)
+            elif lookup_td:
+                propensity_engine.tract_distributions.update(lookup_td)
         propensity_result = propensity_engine.calculate_all_probabilities()
         st.session_state["propensity_result"] = propensity_result
         from app.analysis.census_lookup import normalize_tract_distribution_dict_keys
@@ -2778,6 +2832,74 @@ def _tract_distributions_for_policy(policy_df: pd.DataFrame) -> tuple[dict, dict
     return td, cfmap
 
 
+def _lookup_tract_distribution_from_session() -> tuple[dict, str]:
+    """Build a single-tract distribution from Configure lookup when policy rows lack geo ids."""
+    tract_data = st.session_state.get("census_tract_info") or {}
+    tract = tract_data.get("tract")
+    if tract is None:
+        return {}, ""
+
+    from app.analysis.census_lookup import (
+        canonical_census_geoid_str,
+        fetch_tract_demographics,
+        load_bundled_acs_for_state_fips,
+    )
+
+    geoid = canonical_census_geoid_str(getattr(tract, "geoid", ""))
+    state = str(getattr(tract, "state", "") or "").strip().zfill(2)
+    county = str(getattr(tract, "county", "") or "").strip().zfill(3)
+    tract_fips = str(getattr(tract, "tract", "") or "").strip().zfill(6)
+    if not geoid or not state or not county or not tract_fips:
+        return {}, ""
+
+    demo = None
+    county_name = county
+    bundled = load_bundled_acs_for_state_fips({state})
+    if geoid in bundled:
+        b = bundled[geoid]
+        demo = {
+            "income_probs": b.get("income_probs"),
+            "education_probs": b.get("education_probs"),
+            "household_probs": b.get("household_probs"),
+        }
+        county_name = str(b.get("county_name") or county)
+    else:
+        demo = fetch_tract_demographics(
+            state,
+            county,
+            tract_fips,
+            api_key=st.session_state.get("census_api_key") or None,
+        )
+
+    if not demo:
+        return {}, ""
+
+    inc = np.asarray(demo.get("income_probs"), dtype=float)
+    edu = np.asarray(demo.get("education_probs"), dtype=float)
+    hh = np.asarray(demo.get("household_probs"), dtype=float)
+    if inc.size != 16 or not np.isfinite(inc).all() or float(inc.sum()) <= 0:
+        inc = np.ones(16, dtype=float) / 16.0
+    else:
+        inc = inc / inc.sum()
+    if edu.size != 4 or not np.isfinite(edu).all() or float(edu.sum()) <= 0:
+        edu = np.ones(4, dtype=float) / 4.0
+    else:
+        edu = edu / edu.sum()
+    if hh.size != 7 or not np.isfinite(hh).all() or float(hh.sum()) <= 0:
+        hh = np.ones(7, dtype=float) / 7.0
+    else:
+        hh = hh / hh.sum()
+
+    return {
+        geoid: {
+            "education": edu,
+            "household_size": hh,
+            "income": inc,
+            "county": county_name,
+        }
+    }, geoid
+
+
 def _fig_income_portfolio_distribution(profile_d: dict, title: str) -> go.Figure:
     labels = profile_d.get("labels") or []
     fig = go.Figure()
@@ -3118,8 +3240,6 @@ def _render_adoption_incentive_breakdown(
             )
 
 
-# ── Results charts ─────────────────────────────────────────────────────────────
-
 def _render_result_charts() -> None:
     scenario_results: dict = st.session_state["scenario_results"]
     scenario_results_inc: dict | None = st.session_state.get("scenario_results_incentive")
@@ -3348,23 +3468,45 @@ def _render_result_charts() -> None:
             st.plotly_chart(_propensity_hist(propensity_result, "#2563eb", "Propensity"),
                             use_container_width=True, key="propensity_base")
         with col_e:
-            st.markdown("### Energy Savings vs. Propensity")
-            with st.expander("Definition & formula", expanded=False):
-                st.markdown(_FORMULA_MD_ENERGY_SAVINGS_SCATTER)
+            eh1, eh2 = st.columns([4, 2])
+            with eh1:
+                st.markdown("### Energy Savings vs. Propensity")
             plot_df = policy_impacts if "acceptance_probability" in policy_impacts.columns else (
                 policy_impacts.join(
                     propensity_result.data.set_index("building.id")[["acceptance_probability"]],
                     on="building.id", how="left",
                 )
             )
+            can_kbtu = policy_df_has_kwh_breakdown(plot_df) and "area_m2" in plot_df.columns
+            with eh2:
+                st.toggle(
+                    "kBTU/ft²",
+                    key="results_scatter_savings_kbtu_per_ft2",
+                    disabled=not can_kbtu,
+                    help=(
+                        "Plot annual site energy savings per conditioned sq ft instead of $/yr."
+                        if can_kbtu
+                        else "Needs per-fuel kWh columns and conditioned area on policy impacts."
+                    ),
+                )
+            with st.expander("Definition & formula", expanded=False):
+                st.markdown(_FORMULA_MD_ENERGY_SAVINGS_SCATTER)
+            if not can_kbtu:
+                st.caption("kBTU/ft² axis needs baseline/scenario kWh columns and `area_m2` on policy impacts.")
             if "acceptance_probability" in plot_df.columns and "energy_cost.annual_savings" in plot_df.columns:
+                use_kbtu = bool(st.session_state.get("results_scatter_savings_kbtu_per_ft2", False))
+                x_vals, x_title = scatter_energy_savings_x_values(
+                    plot_df,
+                    use_kbtu_per_sqft=use_kbtu and can_kbtu,
+                    building_area_unit=str(st.session_state.get("building_area_unit", "sqm")),
+                )
                 fig_scatter = go.Figure(go.Scatter(
-                    x=plot_df["energy_cost.annual_savings"],
+                    x=x_vals,
                     y=plot_df["acceptance_probability"],
                     mode="markers", marker=dict(color="#9333ea", size=4, opacity=0.5),
                 ))
                 fig_scatter.update_layout(
-                    xaxis_title="Annual energy savings ($/yr)",
+                    xaxis_title=x_title,
                     yaxis_title="Acceptance probability",
                     height=280, margin=dict(t=10, b=10),
                 )

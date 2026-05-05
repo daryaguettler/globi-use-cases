@@ -671,3 +671,51 @@ def _copy_metadata(src: pd.DataFrame, dst: pd.DataFrame) -> None:
                 dst[dst_col] = src[src_col].values
             except Exception:
                 pass
+
+
+# ieee: 1 kwh = 3412.142 btu (used for optional results-chart axis)
+KWH_TO_KBTU: float = 3412.142 / 1000.0
+
+
+def policy_df_has_kwh_breakdown(df: pd.DataFrame) -> bool:
+    return all(
+        f"baseline_kwh_{f}" in df.columns and f"scenario_kwh_{f}" in df.columns
+        for f in FUEL_LABELS
+    )
+
+
+def annual_site_kwh_savings_kwh(df: pd.DataFrame) -> pd.Series:
+    acc = pd.Series(0.0, index=df.index, dtype=float)
+    for fuel in FUEL_LABELS:
+        bc = f"baseline_kwh_{fuel}"
+        sc = f"scenario_kwh_{fuel}"
+        b = pd.to_numeric(df[bc], errors="coerce").fillna(0.0)
+        s = pd.to_numeric(df[sc], errors="coerce").fillna(0.0)
+        acc = acc + (b - s)
+    return acc.clip(lower=0.0)
+
+
+def conditioned_area_sqft_from_policy(df: pd.DataFrame, building_area_unit: str) -> pd.Series:
+    if "area_m2" not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    raw = pd.to_numeric(df["area_m2"], errors="coerce")
+    u = (building_area_unit or "sqm").strip().lower()
+    if u == "sqft":
+        return raw
+    return raw / SQFT_TO_SQM
+
+
+def scatter_energy_savings_x_values(
+    df: pd.DataFrame,
+    *,
+    use_kbtu_per_sqft: bool,
+    building_area_unit: str,
+) -> tuple[pd.Series, str]:
+    if not use_kbtu_per_sqft:
+        return df["energy_cost.annual_savings"], "Annual energy savings ($/yr)"
+    kwh_sv = annual_site_kwh_savings_kwh(df)
+    kbtu_yr = kwh_sv * KWH_TO_KBTU
+    sqft = conditioned_area_sqft_from_policy(df, building_area_unit)
+    valid = sqft.notna() & (sqft > 0)
+    x_series = (kbtu_yr / sqft).where(valid)
+    return x_series, "Annual site energy savings (kBTU/ft²·yr)"
