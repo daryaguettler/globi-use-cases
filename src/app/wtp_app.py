@@ -236,7 +236,7 @@ The KPI shows **min–max** of \(C_{\mathrm{cohort}}(a)\) across adoption scenar
 
 ### Total expected incentives (adopted cohort)
 
-**Residential:** **expected_incentive_usd** is the mean incentive draw per building. **Commercial** rows are 0. On the same top-\(n\) cohort:
+**Residential:** **expected_incentive_usd** is the mean incentive draw per building; each draw is capped at that row's upfront project cost. **Commercial** rows are 0. On the same top-\(n\) cohort:
 
 $$
 S_{\mathrm{cohort}}(a) = \sum_{i \in \mathrm{top}_n(a)} \text{expected\_incentive\_usd}_i
@@ -258,7 +258,7 @@ _FORMULA_MD_ADOPTION_DEMO_BREAKDOWN = r"""
 
 We compare the top \(n\) building ids by with-incentive propensity vs. the top \(n\) by no-incentive propensity for \(n = \min(n_{\text{no inc}}, n_{\text{inc}})\) from the two runs’ final cumulative %. **Replaced in rank** = \(|S_{\text{inc}} \setminus S_{\text{base}}|\) (same as \(|S_{\text{base}} \setminus S_{\text{inc}}|\) when \(|S|=n\) and ids are unique).
 
-**Expected incentives on the adopted cohort** = sum of `expected_incentive_usd` (mean draw per building from the with-incentive propensity run) over building ids in the with-incentive top-\(n_{\text{inc}}\) set.
+**Expected incentives on the adopted cohort** = sum of `expected_incentive_usd` (mean capped incentive draw per building from the with-incentive propensity run) over building ids in the with-incentive top-\(n_{\text{inc}}\) set.
 
 **Gross cost on the adopted cohort** = sum of `gross_upfront_usd` over the same ids. **Incentives given** = count of those adopters with `expected_incentive_usd` \(> 0\); **avg $ / recipient** uses only the positive amounts in that sum.
 """

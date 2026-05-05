@@ -26,7 +26,7 @@ Output columns added
 - ``acceptance_probability_min/max/mean`` aliases for the MC stats
 - ``acceptance_probability_li/moderate/non_lmi`` cohort-level estimates at fixed incomes
 - ``gross_upfront_usd``                    upfront retrofit **deal** cost in USD (same cost column as the WTP logit, before any income-based incentive in MC)
-- ``expected_incentive_usd``            residential only, mean incentive USD across propensity income draws; 0 for commercial; 0 if incentives disabled
+- ``expected_incentive_usd``            residential only, mean incentive USD across draws (each draw capped at that row's upfront cost); 0 for commercial; 0 if incentives disabled
 
 Example usage::
 
@@ -647,11 +647,11 @@ class PropensityModelEngine(BaseModel):
             savings = energy_savings[idx]
 
             if self.incentive_by_income is not None:
-                # Map each sampled income value → incentive USD, convert to k$ (cost units)
+                # map each sampled income → incentive USD, k$; cannot exceed project cost per draw
                 incentive_lookup = {v: self.incentive_by_income.get(v, 0.0) for v in INCOME_CATEGORIES}
                 incentive_matrix = np.vectorize(incentive_lookup.__getitem__)(inc) / 1000
+                incentive_matrix = np.minimum(incentive_matrix, cost[:, None])
                 cost_input = np.maximum(cost[:, None] - incentive_matrix, 0.0)
-                # mean draw incentive, USD (same expectation as the MC column means)
                 exp_incentive_usd[idx] = (incentive_matrix.mean(axis=1) * 1000.0).astype(float)
             else:
                 cost_input = cost[:, None]
