@@ -49,7 +49,9 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+
+from app.analysis.census_lookup import canonical_census_geoid_str
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,31 @@ _DEFAULT_COUNTY_CONCERN: dict[str, float] = {
     "Suffolk": 3.5,
     "Worcester": 3.2,
 }
+
+# when county name is missing or not in county_concern, use state-level priors (1–5 scale)
+# 53 (WA) aligned with 25 (MA); 04 (AZ) lower per regional prior
+_DEFAULT_CLIMATE_CONCERN_BY_STATE_FIPS: dict[str, float] = {
+    "04": 2,
+    "25": 3.35,
+    "53": 3.35,
+}
+_FALLBACK_CLIMATE_CONCERN: float = 3.5
+
+# lower default neighbour term for AZ (MA-trained model); override via ctor `state_neighbor_effect`.
+_DEFAULT_NEIGHBOR_BY_STATE_FIPS: dict[str, float] = {"04": 1.9}
+
+# scale MA-trained logistic slopes for Concern and Neighbor features when state is AZ (04)
+_ARIZONA_CN_SLOPE_MUL: float = 0.72
+
+
+def _arizona_concern_neighbor_slope_mul(state_fips: str | None) -> tuple[float, float]:
+    """Effective Concern / Neighbor slope multipliers vs MA defaults; AZ (04) damped for now."""
+    st = (state_fips or "").strip().zfill(2)[:2]
+    if st == "04":
+        m = float(_ARIZONA_CN_SLOPE_MUL)
+        return (m, m)
+    return (1.0, 1.0)
+
 
 # MA county FIPS (int) → county name
 _DEFAULT_COUNTY_FIPS_MAP: dict[int, str] = {
@@ -157,7 +184,14 @@ class PropensityModelEngine(BaseModel):
         county_fips_map: Mapping from integer FIPS code to county name, used when
             the census CSV stores county as a FIPS integer.  Defaults to
             ``_DEFAULT_COUNTY_FIPS_MAP`` (Massachusetts).
-        neighbor_effect: Default neighbour adoption influence (1-5 scale).
+        neighbor_effect: Default neighbour adoption influence (1-5 scale). Used when no
+            per-state override applies.
+        state_neighbor_effect: Overrides ``neighbor_effect`` per two-digit ``state_fips``.
+        state_cost_parity_multiplier: Per-state multipliers on retrofit cost (thousands USD) for the residential logit
+            only (behaviour parity with MA-calibrated slopes). Does not affect ``gross_upfront_usd``.
+            Composes with ``cost_logit_multiplier`` (global).
+        cost_logit_multiplier: Positive scalar applied to residential logit cost (thousands USD) for every row,
+            after per-state parity. Default 1.0. Does not affect ``gross_upfront_usd``.
         random_seed: RNG seed for reproducibility.
         n_monte_carlo_samples: Monte Carlo draws per residential building row.
         npv_years: Years over which commercial NPV is evaluated.
@@ -188,6 +222,9 @@ class PropensityModelEngine(BaseModel):
     random_seed: int | None = None
     n_monte_carlo_samples: int | None = None
     incentive_by_income: dict[float, float] | None = None
+    state_neighbor_effect: dict[str, float] | None = None
+    state_cost_parity_multiplier: dict[str, float] | None = None
+    cost_logit_multiplier: float | None = None
 
     # Commercial model parameters
     npv_years: int | None = None
@@ -209,6 +246,10 @@ class PropensityModelEngine(BaseModel):
     cohort_income_levels_k_usd: dict[str, float] = Field(default_factory=dict)
     rng: Any = None
     tract_distributions: dict[str, dict] = Field(default_factory=dict)
+
+    _state_neighbor_by_fips: dict[str, float] = PrivateAttr(default_factory=dict)
+    _state_cost_parity_mul: dict[str, float] = PrivateAttr(default_factory=dict)
+    _logit_cost_scale: float = PrivateAttr(default=1.0)
 
     def model_post_init(self, __context: Any) -> None:
         self.params = {}
@@ -258,6 +299,24 @@ class PropensityModelEngine(BaseModel):
 
         # Resolve behaviour parameters
         self.neighbor_effect = self.neighbor_effect if self.neighbor_effect is not None else prop_cfg.get("neighbor_effect", 3.0)
+        _nei_merge = dict(_DEFAULT_NEIGHBOR_BY_STATE_FIPS)
+        if self.state_neighbor_effect:
+            for k, v in self.state_neighbor_effect.items():
+                ks = str(k).strip().zfill(2)[:2]
+                if ks.isdigit() and len(ks) == 2:
+                    _nei_merge[ks] = float(v)
+        self._state_neighbor_by_fips = _nei_merge
+        self._state_cost_parity_mul = {}
+        if self.state_cost_parity_multiplier:
+            for k, v in self.state_cost_parity_multiplier.items():
+                ks = str(k).strip().zfill(2)[:2]
+                if ks.isdigit() and len(ks) == 2 and float(v) > 0:
+                    self._state_cost_parity_mul[ks] = float(v)
+
+        raw_logit_mul = self.cost_logit_multiplier if self.cost_logit_multiplier is not None else prop_cfg.get("cost_logit_multiplier")
+        _gls = float(raw_logit_mul) if raw_logit_mul is not None else 1.0
+        self._logit_cost_scale = _gls if _gls > 0 else 1.0
+
         self.random_seed = self.random_seed if self.random_seed is not None else prop_cfg.get("random_seed", 42)
         self.rng = np.random.default_rng(self.random_seed)
         self.n_monte_carlo_samples = self.n_monte_carlo_samples if self.n_monte_carlo_samples is not None else prop_cfg.get("n_monte_carlo_samples", 100)
@@ -477,9 +536,33 @@ class PropensityModelEngine(BaseModel):
 
     # ── Probability calculation ───────────────────────────────────────────────
 
-    def _logistic(self, age: float | np.ndarray, edu: float | np.ndarray, hh: float | np.ndarray, inc: float | np.ndarray, concern: float, cost: float | np.ndarray, neighbor: float, savings: float | np.ndarray) -> float | np.ndarray:
+    def _logistic(
+        self,
+        age: float | np.ndarray,
+        edu: float | np.ndarray,
+        hh: float | np.ndarray,
+        inc: float | np.ndarray,
+        concern: float,
+        cost: float | np.ndarray,
+        neighbor: float,
+        savings: float | np.ndarray,
+        *,
+        concern_slope_mul: float = 1.0,
+        neighbor_slope_mul: float = 1.0,
+    ) -> float | np.ndarray:
         mc = self.model_coefficients
-        z = (mc["intercept"] + mc["Year built"] * age + mc["Education"] * edu + mc["bedrooms"] * hh + mc["residents"] * hh + mc["Income"] * inc + mc["Concern"] * concern + mc["Upfront cost"] * cost + mc["Neighbor"] * neighbor + mc["Energy cost"] * savings)
+        z = (
+            mc["intercept"]
+            + mc["Year built"] * age
+            + mc["Education"] * edu
+            + mc["bedrooms"] * hh
+            + mc["residents"] * hh
+            + mc["Income"] * inc
+            + mc["Concern"] * concern * concern_slope_mul
+            + mc["Upfront cost"] * cost
+            + mc["Neighbor"] * neighbor * neighbor_slope_mul
+            + mc["Energy cost"] * savings
+        )
         return 1 / (1 + np.exp(-z))
 
     def _row_gross_capex_usd(self, row: pd.Series) -> float:
@@ -545,6 +628,38 @@ class PropensityModelEngine(BaseModel):
 
         return PropensityResult(data=self.data.copy(), n_buildings=n_buildings, n_scenarios=n_scenarios, mean_acceptance_probability=mean_prob)
 
+    def _resolve_climate_concern(self, county_name: str, state_fips: str | None) -> float:
+        """Climate concern (1–5) for the residential logit.
+
+        ``county_concern`` may list Massachusetts counties by name; a non-MA state must not
+        inherit those labels when county FIPS collides across states—``state_fips`` gates
+        that. Otherwise use :data:`_DEFAULT_CLIMATE_CONCERN_BY_STATE_FIPS` (AZ lower than MA).
+        """
+        st = (state_fips or "").strip().zfill(2)[:2]
+        cn = (county_name or "").strip()
+        if cn and st != "25" and cn in _DEFAULT_COUNTY_CONCERN:
+            cn = ""
+        if cn and cn in self.county_concern:
+            return float(self.county_concern[cn])
+        if st in _DEFAULT_CLIMATE_CONCERN_BY_STATE_FIPS:
+            return float(_DEFAULT_CLIMATE_CONCERN_BY_STATE_FIPS[st])
+        return float(_FALLBACK_CLIMATE_CONCERN)
+
+    def _neighbor_for_state(self, state_fips: str | None) -> float:
+        st = (state_fips or "").strip().zfill(2)[:2]
+        if st and st in self._state_neighbor_by_fips:
+            return float(self._state_neighbor_by_fips[st])
+        return float(self.neighbor_effect)
+
+    def _cost_parity_multiplier_for_row(self, state_fips_raw: Any) -> float:
+        if not self._state_cost_parity_mul:
+            return 1.0
+        raw = str(state_fips_raw or "").strip().split(".")[0]
+        if not raw.isdigit():
+            return 1.0
+        st = raw.zfill(2)[:2]
+        return float(self._state_cost_parity_mul.get(st, 1.0))
+
     def _calculate_residential_probabilities(self, mask: pd.Series) -> None:
         chunk_size = 200_000
         positions = np.where(mask.values)[0]
@@ -562,7 +677,7 @@ class PropensityModelEngine(BaseModel):
         age_map = {"pre_1975": 60, "btw_1975_2003": 35, "post_2003": 15}
 
         county_col = next((c for c in ["building.county", "feature.location.county", "county", "county_fips"] if c in sub.columns), None)
-        counties = sub[county_col].fillna("Middlesex").astype(str) if county_col else pd.Series(["Middlesex"] * n, index=sub.index)
+        counties = sub[county_col].fillna("").astype(str) if county_col else pd.Series([""] * n, index=sub.index)
 
         tract_col = next(
             (c for c in ["building.tract_id", "feature.location.tract_id", "tract_id", "GEOID20", "GEOID"] if c in sub.columns),
@@ -571,18 +686,33 @@ class PropensityModelEngine(BaseModel):
         tract_ids = sub[tract_col] if tract_col else pd.Series([None] * n, index=sub.index)
         geoid_col = "geoid" if "geoid" in sub.columns else None
 
+        if "state_fips" in sub.columns:
+            state_vals = sub["state_fips"].map(
+                lambda v: (
+                    str(v).strip().split(".")[0].zfill(2)[:2]
+                    if v is not None and not (isinstance(v, float) and pd.isna(v)) and str(v).strip()
+                    else ""
+                )
+            ).values
+        else:
+            state_vals = np.array([""] * n, dtype=object)
+
         if "feature.semantic.Age_bracket" in sub.columns:
             building_age = sub["feature.semantic.Age_bracket"].map(age_map).fillna(40).values.astype(float)
         else:
             building_age = np.full(n, 40.0)
 
         if "adjusted_net_cost.AllCustomers" in sub.columns:
-            upfront_cost = sub["adjusted_net_cost.AllCustomers"].fillna(0) / 1000
+            usd_actual = sub["adjusted_net_cost.AllCustomers"].fillna(0).values.astype(float)
         elif "net_cost.AllCustomers" in sub.columns:
-            upfront_cost = sub["net_cost.AllCustomers"].fillna(0) / 1000
+            usd_actual = sub["net_cost.AllCustomers"].fillna(0).values.astype(float)
         else:
-            upfront_cost = sub.get("cost.Total", pd.Series(0, index=sub.index)).fillna(0) / 1000
-        upfront_cost = upfront_cost.values.astype(float)
+            usd_actual = sub.get("cost.Total", pd.Series(0, index=sub.index)).fillna(0).values.astype(float)
+
+        parity = np.array([self._cost_parity_multiplier_for_row(state_vals[i]) for i in range(n)], dtype=float)
+        upfront_cost = (usd_actual / 1000.0) * parity * float(self._logit_cost_scale)
+        cost_k_actual = usd_actual / 1000.0
+        gross_upfront_usd = usd_actual.copy()
 
         if "energy_cost.annual_savings" in sub.columns:
             energy_savings = sub["energy_cost.annual_savings"].clip(lower=0).fillna(0) / 100
@@ -604,7 +734,6 @@ class PropensityModelEngine(BaseModel):
         cohort_mod = np.full(n, np.nan)
         cohort_non = np.full(n, np.nan)
         exp_incentive_usd = np.zeros(n, dtype=float)
-        gross_upfront_usd = (upfront_cost * 1000.0).astype(float)
 
         # group by geoid when present and non-empty, else (county, tract)
         group_indices: dict[tuple, list[int]] = {}
@@ -623,21 +752,40 @@ class PropensityModelEngine(BaseModel):
         for gkey, indices in group_indices.items():
             idx = np.array(indices)
             m = len(idx)
+            st_for_concern = ""
             if gkey[0] == "geoid":
+                gid_key = canonical_census_geoid_str(gkey[1]) or str(gkey[1]).strip()
                 inc_p, edu_p = self._income_education_pmfs("", None, gkey[1])
                 demo = self._sample_demographics("", tract_id=None, n_samples=m * n_samples, geoid=gkey[1])
-                cname = (self.tract_distributions.get(gkey[1]) or {}).get("county") or ""
+                td = self.tract_distributions.get(gid_key) or self.tract_distributions.get(str(gkey[1]).strip()) or {}
+                cname = (td.get("county") or "").strip()
+                st_for_concern = ""
+                if gid_key.isdigit() and len(gid_key) >= 11:
+                    st_for_concern = gid_key[:2]
+                if not st_for_concern:
+                    st_for_concern = str(state_vals[idx[0]]) if len(idx) else ""
             else:
                 _, county, tract_str = gkey
                 inc_p, edu_p = self._income_education_pmfs(str(county), tract_str or None, None)
                 demo = self._sample_demographics(county, tract_id=tract_str or None, n_samples=m * n_samples)
-                cname = county
+                cname = str(county).strip()
+                st_for_concern = str(state_vals[idx[0]]) if len(idx) else ""
+                if not st_for_concern and tract_str:
+                    tg = canonical_census_geoid_str(str(tract_str).strip())
+                    if tg.isdigit() and len(tg) >= 11:
+                        st_for_concern = tg[:2]
+                if not st_for_concern and geoid_vals is not None and len(idx):
+                    tg = canonical_census_geoid_str(geoid_vals[idx[0]])
+                    if tg.isdigit() and len(tg) >= 11:
+                        st_for_concern = tg[:2]
             ip_list = [float(x) for x in inc_p]
             ep_list = [float(x) for x in edu_p]
             ridx = sub.index[idx]
             self.data.loc[ridx, "income_probs"] = pd.Series([ip_list] * m, index=ridx, dtype=object)
             self.data.loc[ridx, "education_probs"] = pd.Series([ep_list] * m, index=ridx, dtype=object)
-            concern = self.county_concern.get(cname, 3.5)
+            concern = self._resolve_climate_concern(cname, st_for_concern)
+            nbr = self._neighbor_for_state(st_for_concern)
+            c_sm, n_sm = _arizona_concern_neighbor_slope_mul(st_for_concern)
 
             edu = demo["education"].reshape(m, n_samples)
             hh = demo["household_size"].reshape(m, n_samples)
@@ -647,16 +795,29 @@ class PropensityModelEngine(BaseModel):
             savings = energy_savings[idx]
 
             if self.incentive_by_income is not None:
-                # map each sampled income → incentive USD, k$; cannot exceed project cost per draw
+                # incentive usd→k$; cap at actual project size (parity scales logit-only baseline cost)
                 incentive_lookup = {v: self.incentive_by_income.get(v, 0.0) for v in INCOME_CATEGORIES}
                 incentive_matrix = np.vectorize(incentive_lookup.__getitem__)(inc) / 1000
-                incentive_matrix = np.minimum(incentive_matrix, cost[:, None])
+                incentive_matrix = np.minimum(incentive_matrix, cost_k_actual[idx][:, None])
                 cost_input = np.maximum(cost[:, None] - incentive_matrix, 0.0)
                 exp_incentive_usd[idx] = (incentive_matrix.mean(axis=1) * 1000.0).astype(float)
             else:
                 cost_input = cost[:, None]
 
-            probs: np.ndarray = np.asarray(self._logistic(age[:, None], edu, hh, inc, concern, cost_input, self.neighbor_effect, savings[:, None]))
+            probs: np.ndarray = np.asarray(
+                self._logistic(
+                    age[:, None],
+                    edu,
+                    hh,
+                    inc,
+                    concern,
+                    cost_input,
+                    nbr,
+                    savings[:, None],
+                    concern_slope_mul=c_sm,
+                    neighbor_slope_mul=n_sm,
+                )
+            )
             propensity_min[idx] = probs.min(axis=1)
             propensity_max[idx] = probs.max(axis=1)
             propensity_mean[idx] = probs.mean(axis=1)
@@ -666,7 +827,18 @@ class PropensityModelEngine(BaseModel):
                 edu_mean = edu.mean(axis=1)
                 hh_mean = hh.mean(axis=1)
                 for inc_k, arr_out in ((self.cohort_income_levels_k_usd["li"], cohort_li), (self.cohort_income_levels_k_usd["moderate"], cohort_mod), (self.cohort_income_levels_k_usd["non_lmi"], cohort_non)):
-                    arr_out[idx] = self._logistic(age, edu_mean, hh_mean, inc_k, concern, cost, self.neighbor_effect, savings)
+                    arr_out[idx] = self._logistic(
+                        age,
+                        edu_mean,
+                        hh_mean,
+                        inc_k,
+                        concern,
+                        cost,
+                        nbr,
+                        savings,
+                        concern_slope_mul=c_sm,
+                        neighbor_slope_mul=n_sm,
+                    )
 
         self.data.loc[mask, "acceptance_probability"] = propensity_mean
         self.data.loc[mask, "propensity_min"] = propensity_min

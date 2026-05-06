@@ -40,22 +40,45 @@ def _repo_root() -> Path:
 
 
 def canonical_census_geoid_str(val: object) -> str:
-    """Normalize tract GEOID for dict lookup (fixes float serialization e.g. 25017300100.0)."""
+    """Normalize tract GEOID for dict lookup.
+
+    Handles float serialization (e.g. ``25017300100.0``) and restores a leading
+    state FIPS digit when GEOIDs are stored numerically without it (many ``04…``
+    tracts serialize as ten-digit ints/floats).
+    """
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return ""
     if isinstance(val, (int, np.integer)):
-        return str(int(val))
+        digits = str(int(val))
+        if digits.isdigit() and len(digits) >= 11:
+            return digits[:11]
+        if digits.isdigit() and len(digits) == 10:
+            return digits.zfill(11)
+        return digits
     s = str(val).strip()
     if not s or s.lower() in ("nan", "none"):
         return ""
     try:
         x = float(s)
-        if np.isfinite(x) and x >= 1e10:
-            return str(int(round(x)))
-    except (TypeError, ValueError):
+        if np.isfinite(x) and x >= 1e9:
+            digits = str(int(round(x)))
+            if len(digits) >= 11:
+                return digits[:11]
+            if len(digits) == 10:
+                return digits.zfill(11)
+    except (TypeError, ValueError, OverflowError):
         pass
     if s.endswith(".0") and len(s) > 2 and s[:-2].isdigit():
-        return s[:-2]
+        d = "".join(c for c in s[:-2] if c.isdigit())
+        if len(d) >= 11:
+            return d[:11]
+        if len(d) == 10:
+            return d.zfill(11)
+    digits = "".join(c for c in s if c.isdigit())
+    if len(digits) >= 11:
+        return digits[:11]
+    if len(digits) == 10:
+        return digits.zfill(11)
     return s
 
 
@@ -221,6 +244,8 @@ def parse_static_census_geoid(val: Any) -> CensusGeocodeResult | None:
     if val is None or (isinstance(val, float) and pd.isna(val)):
         return None
     s = "".join(c for c in str(val).strip() if c.isdigit())
+    if len(s) == 10:
+        s = s.zfill(11)
     if len(s) < 11:
         return None
     s = s[:11]
@@ -233,6 +258,58 @@ _GEOID_SOURCE_COLUMNS: tuple[str, ...] = (
     "GEOID20",
     "feature.location.tract_id",
 )
+
+
+def coerce_census_geocode_result(obj: Any) -> CensusGeocodeResult | None:
+    """Build :class:`CensusGeocodeResult` from session/UI objects or dicts."""
+    if obj is None:
+        return None
+    if isinstance(obj, CensusGeocodeResult):
+        return obj
+    if isinstance(obj, dict) and all(k in obj for k in ("state", "county", "tract", "geoid")):
+        return CensusGeocodeResult(
+            state=str(obj.get("state") or ""),
+            county=str(obj.get("county") or ""),
+            tract=str(obj.get("tract") or ""),
+            geoid=str(obj.get("geoid") or ""),
+        )
+    return None
+
+
+def prefill_geocode_rows_from_session_result(
+    df: pd.DataFrame,
+    result: CensusGeocodeResult | None,
+) -> pd.DataFrame:
+    """Fill census FIPS columns from a geocoder result (e.g. Configure-tab centroid lookup).
+
+    Only rows with missing ``geoid`` are updated so tract ids from uploaded files
+    still win.
+    """
+    parsed = coerce_census_geocode_result(result)
+    if parsed is None:
+        return df
+    parts = parse_static_census_geoid(parsed.geoid)
+    if parts is None:
+        s = str(parsed.state or "").strip().zfill(2)
+        c = str(parsed.county or "").strip().zfill(3)
+        t = str(parsed.tract or "").strip().zfill(6)
+        if len(s) == 2 and len(c) == 3 and len(t) == 6:
+            parts = CensusGeocodeResult(state=s, county=c, tract=t, geoid=f"{s}{c}{t}")
+        else:
+            return df
+    out = df.copy()
+    for col in ("state_fips", "county_fips", "tract_fips", "geoid"):
+        if col not in out.columns:
+            out[col] = None
+    for idx in out.index:
+        existing = out.at[idx, "geoid"]
+        if pd.notna(existing) and str(existing).strip():
+            continue
+        out.at[idx, "state_fips"] = parts.state
+        out.at[idx, "county_fips"] = parts.county
+        out.at[idx, "tract_fips"] = parts.tract
+        out.at[idx, "geoid"] = parts.geoid
+    return out
 
 
 def prefill_geocode_columns_from_tract_ids(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -581,6 +658,8 @@ def enrich_with_census(
     lon_col: str = "lon",
     max_buildings: int = 500,
     use_disk_cache: bool = True,
+    *,
+    session_geocode_result: CensusGeocodeResult | None = None,
 ) -> pd.DataFrame:
     """Geocode buildings and fetch ACS demographics, returning an enriched DataFrame.
 
@@ -594,9 +673,14 @@ def enrich_with_census(
     If the frame already has an 11-digit tract GEOID (e.g. ``building.tract_id``),
     those rows are filled without calling the Census Geocoder. Remaining rows
     are geocoded from lat/lon as usual.
+
+    Pass ``session_geocode_result`` with the Configure-tab centroid lookup so rows
+    still missing a GEOID reuse that tract before calling the geocoder (bundled ACS
+    can then load by state without per-building geocode).
     """
     out = df.copy()
     out, _n_pre = prefill_geocode_columns_from_tract_ids(out)
+    out = prefill_geocode_rows_from_session_result(out, session_geocode_result)
     out = batch_geocode(
         out,
         lat_col=lat_col,
@@ -690,8 +774,9 @@ def tract_distributions_from_enriched(
 ) -> dict[str, dict]:
     """Build ``PropensityModelEngine.tract_distributions`` entries keyed by ``geoid``.
 
-    Uses columns produced by :func:`enrich_with_census`. County names are resolved
-    via ``county_fips_map`` when possible (defaults to MA in the app engine).
+    Uses columns produced by :func:`enrich_with_census`. ``county_fips_map`` is
+    applied only when ``state_fips`` is Massachusetts (25); otherwise rely on
+    ``census_tract_county_name`` so AZ/… county codes do not collide with MA.
     """
     county_fips_map = county_fips_map or {}
     required = ("geoid", "income_probs", "education_probs")
@@ -714,12 +799,15 @@ def tract_distributions_from_enriched(
         if "census_tract_county_name" in df.columns and pd.notna(row.get("census_tract_county_name")):
             county_name = str(row["census_tract_county_name"]).strip()
         cfi = row.get("county_fips")
+        # county_fips is only unique within a state; the default engine map is MA-only.
         if not county_name and cfi is not None and pd.notna(cfi):
-            try:
-                ck = int(float(str(cfi).split(".")[0]))
-                county_name = county_fips_map.get(ck) or ""
-            except (TypeError, ValueError):
-                county_name = ""
+            state_st = str(row.get("state_fips", "") or "").strip().zfill(2)[:2]
+            if state_st == "25" and county_fips_map:
+                try:
+                    ck = int(float(str(cfi).split(".")[0]))
+                    county_name = county_fips_map.get(ck) or ""
+                except (TypeError, ValueError):
+                    county_name = ""
         if not county_name and cfi is not None and pd.notna(cfi):
             county_name = str(cfi).strip()
 

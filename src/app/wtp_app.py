@@ -24,6 +24,7 @@ import copy
 import zipfile
 from functools import reduce
 from pathlib import Path
+from typing import Any
 
 import matplotlib
 import matplotlib.cm
@@ -406,6 +407,105 @@ def _load_energy_with_session_crs(source: str | bytes) -> pd.DataFrame:
     )
 
 
+def _reference_year_with_baseline(year_files: dict, selected_years: list) -> int | None:
+    ref_years = [y for y in sorted(selected_years) if year_files.get(y, {}).get("baseline")]
+    return ref_years[0] if ref_years else None
+
+
+def _building_lat_lon_lists_from_flat(
+    base_flat: pd.DataFrame,
+    *,
+    footprint_epsg: str | None,
+    rewrite_footprints_wgs84: bool,
+) -> tuple[list[float], list[float]]:
+    """Same coordinate extraction as the Configure census-tract preview (footprint or lat/lon)."""
+    import base64
+    from shapely import wkb as shapely_wkb
+    from shapely import wkt as shapely_wkt
+
+    rect_col = rotated_rectangle_column(base_flat)
+    building_lats: list[float] = []
+    building_lons: list[float] = []
+
+    if rect_col is not None:
+        def _load_geometry(s: str):
+            try:
+                return shapely_wkt.loads(s)
+            except Exception:
+                pass
+            try:
+                return shapely_wkb.loads(base64.b64decode(s))
+            except Exception:
+                return None
+
+        wkt_series = base_flat[rect_col].dropna().astype(str)
+        geoms = wkt_series.map(_load_geometry).dropna()
+        if rewrite_footprints_wgs84:
+            rect_epsg = "EPSG:4326"
+        else:
+            rect_epsg = resolved_rotated_rectangle_epsg(
+                base_flat, rect_col, user_crs=footprint_epsg
+            )
+        gs = gpd.GeoSeries(geoms, crs=rect_epsg).to_crs("EPSG:4326")
+        centroids = gs.centroid
+        building_lons = centroids.x.tolist()
+        building_lats = centroids.y.tolist()
+    else:
+        lat_col = next(
+            (c for c in ["lat", "feature.location.lat"] if c in base_flat.columns),
+            None,
+        )
+        lon_col = next(
+            (c for c in ["lon", "feature.location.lon"] if c in base_flat.columns),
+            None,
+        )
+        if lat_col and lon_col:
+            building_lats = pd.to_numeric(base_flat[lat_col], errors="coerce").dropna().tolist()
+            building_lons = pd.to_numeric(base_flat[lon_col], errors="coerce").dropna().tolist()
+
+    return building_lats, building_lons
+
+
+def _session_centroid_tract_geocode(*, persist_to_session: bool = True):
+    """Average building centroid from reference baseline, then Census tract geocode (Configure-tab logic).
+
+    Returns ``(tract_result | None, meta_dict)`` where *meta_dict* has centroid and building lists when
+    coordinates were available. Optionally writes ``census_tract_info`` in session.
+    """
+    from app.analysis.census_lookup import CensusGeocodeResult, geocode_point
+
+    year_files = st.session_state.get("year_files", {})
+    selected_years = st.session_state.get("selected_years", [])
+    ref_yr = _reference_year_with_baseline(year_files, selected_years)
+    if ref_yr is None:
+        return None, {}
+
+    base_flat = _load_energy_with_session_crs(year_files[ref_yr]["baseline"])
+    footprint_epsg = _resolve_session_footprint_epsg()
+    rewrite_wgs84 = bool(st.session_state.get("rewrite_footprints_wgs84", False))
+    lats, lons = _building_lat_lon_lists_from_flat(
+        base_flat,
+        footprint_epsg=footprint_epsg,
+        rewrite_footprints_wgs84=rewrite_wgs84,
+    )
+    if not lats or not lons:
+        return None, {}
+
+    centroid_lat = float(sum(lats) / len(lats))
+    centroid_lon = float(sum(lons) / len(lons))
+    tract_info: CensusGeocodeResult | None = geocode_point(centroid_lat, centroid_lon)
+    meta = {
+        "centroid_lat": centroid_lat,
+        "centroid_lon": centroid_lon,
+        "building_lats": lats,
+        "building_lons": lons,
+        "n_buildings": len(base_flat),
+    }
+    if persist_to_session:
+        st.session_state["census_tract_info"] = {"tract": tract_info, **meta}
+    return tract_info, meta
+
+
 _STATE_DEFAULTS: dict = {
     # {year: {"baseline": bytes, "scenario": bytes}} — one pair per simulated year
     "year_files": {},
@@ -426,6 +526,8 @@ _STATE_DEFAULTS: dict = {
     "rewrite_footprints_wgs84": False,
     # sqm or sqft — unit of conditioned floor area column in EnergyAndPeak parquet
     "building_area_unit": "sqm",
+    # logit-only residential cost scale vs ma-trained baseline (Configure); 1=no adjustment
+    "propensity_ma_labor_parity_az": 1.0,
 }
 for k, v in _STATE_DEFAULTS.items():
     if k not in st.session_state:
@@ -475,6 +577,16 @@ def _save_emissions_json(data: dict) -> None:
     st.cache_data.clear()
 
 
+def _propensity_cost_logit_kwargs() -> dict[str, Any]:
+    """Pass :class:`PropensityModelEngine` ``cost_logit_multiplier`` (all US residential rows)."""
+    if not st.session_state.get("is_us", True):
+        return {}
+    p = float(st.session_state.get("propensity_ma_labor_parity_az", 1.0))
+    if p <= 0 or abs(p - 1.0) <= 1e-9:
+        return {}
+    return {"cost_logit_multiplier": p}
+
+
 # ── Config management ──────────────────────────────────────────────────────────
 
 def _list_saved_configs() -> list[str]:
@@ -497,6 +609,7 @@ def _save_config(name: str) -> None:
         "emissions_trajectories": _load_emissions_json(),
         "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
         "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "propensity_ma_labor_parity_az": float(st.session_state.get("propensity_ma_labor_parity_az", 1.0)),
         "building_area_unit": str(st.session_state.get("building_area_unit", "sqm")),
         "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
         "incentive_config": incentive_cfg.model_dump(),
@@ -525,6 +638,8 @@ def _load_config(name: str) -> bool:
         st.session_state["energy_prices"] = config["energy_prices"]
     if "cost_per_sqm" in config:
         st.session_state["cost_per_sqm"] = float(config["cost_per_sqm"])
+    if "propensity_ma_labor_parity_az" in config:
+        st.session_state["propensity_ma_labor_parity_az"] = float(config["propensity_ma_labor_parity_az"])
     if "building_area_unit" in config:
         u = str(config["building_area_unit"]).lower()
         st.session_state["building_area_unit"] = u if u in ("sqm", "sqft") else "sqm"
@@ -711,6 +826,7 @@ def _save_scenario_results(name: str) -> None:
         "emissions_trajectories": _load_emissions_json(),
         "energy_prices": st.session_state.get("energy_prices", dict(DEFAULT_ENERGY_PRICES)),
         "cost_per_sqm": float(st.session_state.get("cost_per_sqm", 150.0)),
+        "propensity_ma_labor_parity_az": float(st.session_state.get("propensity_ma_labor_parity_az", 1.0)),
         "building_area_unit": str(st.session_state.get("building_area_unit", "sqm")),
         "incentives_enabled": bool(st.session_state.get("incentives_enabled", False)),
         "incentive_config": incentive_cfg.model_dump(),
@@ -1470,6 +1586,23 @@ def _render_config_tab() -> None:
             help="Free key from api.census.gov/data/key_signup.html — improves reliability.",
         )
         st.session_state["census_api_key"] = api_key
+
+        with st.expander("Cost adjustment factors", expanded=False):
+            st.caption(
+                "Residential willingness-to-pay was calibrated in Massachusetts. This multiplier scales the "
+                "**retrofit cost in the logit** for every residential row in the run; **reported** gross upfront "
+                "cost is unchanged."
+            )
+            p_az = st.number_input(
+                "Residential WTP — cost multiplier (×)",
+                min_value=0.5,
+                max_value=2.5,
+                value=float(st.session_state.get("propensity_ma_labor_parity_az", 1.0)),
+                step=0.05,
+                key="cfg_propensity_ma_labor_parity_az",
+                help="Applies to all US residential buildings after you run the pipeline (not only one state).",
+            )
+            st.session_state["propensity_ma_labor_parity_az"] = p_az
     else:
         st.markdown("Enter approximate income and education distributions as priors.")
         p_col1, p_col2 = st.columns(2)
@@ -1575,75 +1708,11 @@ def _render_census_tract_lookup() -> None:
         st.info("Upload a baseline file in Step 1 to look up the census tract.")
         return
 
-    ref_yr = ref_years[0]
     if st.button("Look up census tract from building coordinates", key="cfg_lookup_tract"):
         with st.spinner("Calling Census Geocoder API…"):
             try:
-                from app.analysis.census_lookup import geocode_point
-                import geopandas as gpd
-                from shapely import wkt as shapely_wkt
-
-                base_flat = _load_energy_with_session_crs(year_files[ref_yr]["baseline"])
-
-                rect_col = rotated_rectangle_column(base_flat)
-
-                building_lats: list[float] = []
-                building_lons: list[float] = []
-
-                if rect_col is not None:
-                    import base64
-                    from shapely import wkb as shapely_wkb
-
-                    def _load_geometry(s: str):
-                        """Parse WKT string or base64-encoded WKB (P3 format)."""
-                        try:
-                            return shapely_wkt.loads(s)
-                        except Exception:
-                            pass
-                        try:
-                            return shapely_wkb.loads(base64.b64decode(s))
-                        except Exception:
-                            return None
-
-                    wkt_series = base_flat[rect_col].dropna().astype(str)
-                    geoms = wkt_series.map(_load_geometry).dropna()
-                    if st.session_state.get("rewrite_footprints_wgs84"):
-                        rect_epsg = "EPSG:4326"
-                    else:
-                        rect_epsg = resolved_rotated_rectangle_epsg(
-                            base_flat, rect_col, user_crs=_resolve_session_footprint_epsg()
-                        )
-                    gs = gpd.GeoSeries(geoms, crs=rect_epsg).to_crs("EPSG:4326")
-                    centroids = gs.centroid
-                    building_lons = centroids.x.tolist()
-                    building_lats = centroids.y.tolist()
-                else:
-                    # Fall back to direct lat/lon columns
-                    lat_col = next(
-                        (c for c in ["lat", "feature.location.lat"] if c in base_flat.columns),
-                        None,
-                    )
-                    lon_col = next(
-                        (c for c in ["lon", "feature.location.lon"] if c in base_flat.columns),
-                        None,
-                    )
-                    if lat_col and lon_col:
-                        building_lats = pd.to_numeric(base_flat[lat_col], errors="coerce").dropna().tolist()
-                        building_lons = pd.to_numeric(base_flat[lon_col], errors="coerce").dropna().tolist()
-
-                if building_lats and building_lons:
-                    centroid_lat = float(sum(building_lats) / len(building_lats))
-                    centroid_lon = float(sum(building_lons) / len(building_lons))
-                    tract_info = geocode_point(centroid_lat, centroid_lon)
-                    st.session_state["census_tract_info"] = {
-                        "tract": tract_info,
-                        "centroid_lat": centroid_lat,
-                        "centroid_lon": centroid_lon,
-                        "building_lats": building_lats,
-                        "building_lons": building_lons,
-                        "n_buildings": len(base_flat),
-                    }
-                else:
+                tract_info, meta = _session_centroid_tract_geocode(persist_to_session=True)
+                if tract_info is None and not meta:
                     st.warning(
                         "No rotated_rectangle or lat/lon columns found in the uploaded baseline file."
                     )
@@ -2274,6 +2343,8 @@ def _run_pipeline(simulated_years: list[int]) -> None:
     st.session_state["simulated_years"] = simulated_years
     progress.progress(25, text=f"Energy savings computed for {len(policy_impacts)} buildings across {len(year_energy_data)} year(s).")
 
+    _cal_kw = _propensity_cost_logit_kwargs()
+
     # ── 2. Census enrichment (US only) ───────────────────────────────────────
     if st.session_state.get("is_us", True) and st.session_state.get("census_csv_bytes") is None:
         if "lat" in policy_impacts.columns and "lon" in policy_impacts.columns:
@@ -2281,12 +2352,19 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 30,
                 text="Census enrichment: GEOID column or geocoder, then ACS (bundled state files when available)…",
             )
-            from app.analysis.census_lookup import enrich_with_census
+            from app.analysis.census_lookup import coerce_census_geocode_result, enrich_with_census
+
+            session_tr, _cent_meta = _session_centroid_tract_geocode(persist_to_session=True)
+            if session_tr is None and not _cent_meta:
+                session_tr = coerce_census_geocode_result(
+                    (st.session_state.get("census_tract_info") or {}).get("tract")
+                )
             policy_impacts = enrich_with_census(
                 policy_impacts,
                 api_key=st.session_state.get("census_api_key") or None,
                 lat_col="lat", lon_col="lon",
                 max_buildings=min(500, len(policy_impacts)),
+                session_geocode_result=session_tr,
             )
             st.session_state["policy_impacts"] = policy_impacts
 
@@ -2320,6 +2398,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
             census_data_path=census_path,
             n_monte_carlo_samples=int(st.session_state.get("n_mc_samples", 100)),
             random_seed=int(st.session_state.get("random_seed", 42)),
+            **_cal_kw,
         )
         if not st.session_state.get("is_us", True):
             _apply_non_us_priors(propensity_engine)
@@ -2377,6 +2456,7 @@ def _run_pipeline(simulated_years: list[int]) -> None:
                 n_monte_carlo_samples=int(st.session_state.get("n_mc_samples", 100)),
                 random_seed=int(st.session_state.get("random_seed", 42)),
                 incentive_by_income=incentive_map,
+                **_cal_kw,
             )
             if not st.session_state.get("is_us", True):
                 _apply_non_us_priors(propensity_engine_inc)
